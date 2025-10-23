@@ -781,6 +781,7 @@ class BatchProcessorApp(tk.Tk):
     def update_timezone_only(self, device):
         """
         Ustawia strefę czasową i restartuje. Pomija, jeśli już OK.
+        UŻYWA SU I ROOT - jak w wersji pojedynczej.
         """
         self.log(f"🕐 Aktualizacja strefy czasowej na {TIMEZONE}...")
         
@@ -799,34 +800,47 @@ class BatchProcessorApp(tk.Tk):
         ssh = None
         
         try:
-            # 3. Połącz i ustaw strefę czasową
+            # 3. Połącz
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             ssh.connect(device.ip, username=PLC_USER, password=device.password, timeout=30)
             
             self.log(f"  📝 Ustawianie strefy czasowej na {TIMEZONE}...")
             
-            # Wpisanie TIMEZONE do /etc/timezone
-            stdin, stdout, stderr = ssh.exec_command(f"sudo sh -c 'echo {TIMEZONE} > /etc/timezone'", get_pty=True)
-            stdin.write(device.password + "\n")
-            stdin.flush()
-            time.sleep(1) 
+            # UŻYJ METODY Z SU (jak w pojedynczym sterowniku)
+            shell = ssh.invoke_shell()
             
-            # Użycie timedatectl (dla pełniejszej kompatybilności)
-            stdin, stdout, stderr = ssh.exec_command(f"sudo timedatectl set-timezone {TIMEZONE}", get_pty=True)
-            stdin.write(device.password + "\n")
-            stdin.flush()
-
+            def send_cmd(cmd, wait=1):
+                shell.send(cmd + "\n")
+                time.sleep(wait)
+            
+            # Ustaw hasło root
+            send_cmd("sudo passwd root")
+            send_cmd(device.password)  # sudo password (admin)
+            send_cmd(ROOT_PASS)        # nowe hasło root
+            send_cmd(ROOT_PASS)        # potwierdzenie
+            
+            # Przełącz na root
+            send_cmd("su")
+            send_cmd(ROOT_PASS)
+            
+            # Ustaw strefę czasową
+            send_cmd(f"ln -sf /usr/share/zoneinfo/{TIMEZONE} /etc/localtime")
+            send_cmd(f"echo '{TIMEZONE}' > /etc/timezone")
+            
+            # Wyłącz hasło root (bezpieczeństwo)
+            send_cmd("passwd -dl root")
+            send_cmd("exit")
+            
+            # Restart
+            send_cmd("sudo reboot")
+            send_cmd(device.password)
+            
+            time.sleep(3)
+            
             device.timezone = TIMEZONE
-            
-            # 4. RESTART STEROWNIKA
-            self.log(f"  🔄 Restartowanie sterownika...")
-            stdin, stdout, stderr = ssh.exec_command("sudo reboot", get_pty=True)
-            stdin.write(device.password + "\n")
-            stdin.flush()
-            time.sleep(2)
-            
             ssh.close()
+            
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.log(f"  ✓ Strefa czasowa ustawiona. Sterownik restartuje się.")
             
@@ -834,7 +848,10 @@ class BatchProcessorApp(tk.Tk):
             
         except Exception as e:
             if ssh:
-                ssh.close()
+                try:
+                    ssh.close()
+                except:
+                    pass
             raise e
 
 
@@ -1148,15 +1165,32 @@ class BatchProcessorApp(tk.Tk):
             if device.timezone.strip() != TIMEZONE.strip():
                 self.log(f"  🕐 Strefa czasowa niepoprawna. Ustawianie na {TIMEZONE}...")
                 
-                stdin, stdout, stderr = ssh.exec_command(f"sudo sh -c 'echo {TIMEZONE} > /etc/timezone'", get_pty=True)
-                stdin.write(device.password + "\n")
-                stdin.flush()
-                time.sleep(1)
+                # UŻYJ INVOKE_SHELL + SU (jak w pojedynczym sterowniku)
+                shell = ssh.invoke_shell()
                 
-                stdin, stdout, stderr = ssh.exec_command(f"sudo timedatectl set-timezone {TIMEZONE}", get_pty=True)
-                stdin.write(device.password + "\n")
-                stdin.flush()
-                time.sleep(1)
+                def send_cmd(cmd, wait=1):
+                    shell.send(cmd + "\n")
+                    time.sleep(wait)
+                
+                # Ustaw hasło root
+                send_cmd("sudo passwd root")
+                send_cmd(device.password)
+                send_cmd(ROOT_PASS)
+                send_cmd(ROOT_PASS)
+                
+                # Przełącz na root
+                send_cmd("su")
+                send_cmd(ROOT_PASS)
+                
+                # Ustaw strefę czasową
+                send_cmd(f"ln -sf /usr/share/zoneinfo/{TIMEZONE} /etc/localtime")
+                send_cmd(f"echo '{TIMEZONE}' > /etc/timezone")
+                
+                # Wyłącz hasło root
+                send_cmd("passwd -dl root")
+                send_cmd("exit")
+                
+                time.sleep(2)
                 
                 device.timezone = TIMEZONE
                 self.log("  ✓ Strefa czasowa ustawiona.")
