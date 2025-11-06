@@ -10,7 +10,7 @@ import sys
 import openpyxl
 from openpyxl.styles import PatternFill, Font
 import queue
-
+from contextlib import contextmanager
 
 # cd "C:\Users\dawid.wiselka\OneDrive - NOMAD ELECTRIC Sp. z o.o\Dokumenty\Farmy\Updater\all"
 # python FirmwareUpdater_listaExcel.py
@@ -77,6 +77,413 @@ class BatchProcessorApp(tk.Tk):
         # Timer do aktualizacji logów
         self.update_logs()
 
+
+    @contextmanager
+    def ssh_connection(self, device):
+        """
+        Context manager dla bezpiecznego zarządzania połączeniem SSH.
+        Automatycznie zamyka połączenie nawet przy błędach.
+        
+        Użycie:
+            with self.ssh_connection(device) as (ssh, sftp):
+                # ... operacje ...
+        """
+        ssh = None
+        sftp = None
+        
+        try:
+            self.log(f"  🔗 Otwieranie połączenia SSH do {device.ip}...")
+            
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            # Zwiększone timeouty dla stabilności
+            ssh.connect(
+                device.ip, 
+                username=PLC_USER, 
+                password=device.password, 
+                timeout=30,
+                banner_timeout=30,
+                auth_timeout=30
+            )
+            
+            # Otwórz SFTP tylko gdy potrzebne
+            sftp = ssh.open_sftp()
+            
+            self.log(f"  ✓ Połączono z {device.ip}")
+            
+            yield ssh, sftp
+            
+        except Exception as e:
+            self.log(f"  ❌ Błąd połączenia SSH: {str(e)}")
+            raise
+            
+        finally:
+            # ZAWSZE zamknij połączenia
+            if sftp:
+                try:
+                    sftp.close()
+                    self.log(f"  🔒 Zamknięto SFTP")
+                except Exception as e:
+                    self.log(f"  ⚠️  Błąd zamykania SFTP: {str(e)}")
+            
+            if ssh:
+                try:
+                    ssh.close()
+                    self.log(f"  🔒 Zamknięto SSH")
+                except Exception as e:
+                    self.log(f"  ⚠️  Błąd zamykania SSH: {str(e)}")
+            
+            # Dodatkowe czekanie na pełne zamknięcie
+            time.sleep(0.5)
+
+
+    def execute_firmware_update(self, device):
+        """
+        Wykonuje sudo update firmware (tworzy NOWE połączenie SSH).
+        Bezpiecznie zamyka połączenie przed rebootem.
+        """
+        ssh = None
+        try:
+            self.log(f"  🔗 Nowe połączenie SSH dla firmware update...")
+            
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                device.ip, 
+                username=PLC_USER, 
+                password=device.password, 
+                timeout=30
+            )
+            
+            update_command = f"sudo update-axcf{device.plc_model}"
+            self.log(f"  ⚠️ Uruchamiam: {update_command}")
+            self.log(f"  ⏳ Czekam na zakończenie procesu update (może zająć kilka minut)...")
+            
+            channel = ssh.get_transport().open_session()
+            channel.get_pty()
+            channel.exec_command(update_command)
+            
+            channel.send(device.password + "\n")
+            
+            output = ""
+            start_time = time.time()
+            timeout = 300  # 5 minut
+            
+            while True:
+                if time.time() - start_time > timeout:
+                    self.log("  ⚠️ Timeout - przekroczono 5 minut oczekiwania")
+                    break
+                
+                if channel.recv_ready():
+                    chunk = channel.recv(1024).decode(errors="ignore")
+                    output += chunk
+                    for line in chunk.split('\n'):
+                        if line.strip() and any(keyword in line.lower() for keyword in 
+                            ['installing', 'updating', 'done', 'success', 'error', 'failed', 'reboot']):
+                            self.log(f"    {line.strip()}")
+                
+                if channel.exit_status_ready():
+                    exit_code = channel.recv_exit_status()
+                    self.log(f"  ✓ Proces zakończony z kodem: {exit_code}")
+                    break
+                
+                time.sleep(0.5)
+            
+            if channel.recv_stderr_ready():
+                errors = channel.recv_stderr(4096).decode(errors="ignore")
+                if errors.strip():
+                    self.log(f"  ⚠️ Stderr: {errors[:200]}")
+            
+            channel.close()
+            ssh.close()
+            
+            self.log("  ✓ Aktualizacja firmware zakończona. Sterownik restartuje się")
+            self.log("  ⏳ Czekam 30s na restart sterownika...")
+            time.sleep(30)
+            
+        except Exception as e:
+            if ssh:
+                try:
+                    ssh.close()
+                except:
+                    pass
+            raise e
+
+    def execute_reboot(self, device):
+        """
+        Wykonuje sudo reboot (tworzy NOWE połączenie SSH).
+        Bezpiecznie zamyka połączenie przed rebootem.
+        """
+        ssh = None
+        try:
+            self.log(f"  🔗 Nowe połączenie SSH dla reboot...")
+            
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                device.ip, 
+                username=PLC_USER, 
+                password=device.password, 
+                timeout=30
+            )
+            
+            self.log("  ⚠️ Uruchamiam 'sudo reboot'...")
+            
+            stdin, stdout, stderr = ssh.exec_command("sudo reboot", get_pty=True)
+            stdin.write(device.password + "\n")
+            stdin.flush()
+            time.sleep(2)
+            
+            ssh.close()
+            
+            self.log("  ✓ Sterownik restartuje się")
+            self.log("  ⏳ Czekam 30s na restart sterownika...")
+            time.sleep(30)
+            
+        except Exception as e:
+            if ssh:
+                try:
+                    ssh.close()
+                except:
+                    pass
+            # Ignoruj błędy zamknięcia - reboot ich powoduje
+            if "Socket is closed" in str(e) or "Timeout" in str(e):
+                self.log("  ✓ Reboot zainicjowany (połączenie przerwane - oczekiwane)")
+            else:
+                raise e
+
+
+
+
+    def upload_callback(self, filename, transferred, total):
+        """
+        Callback wywoływany podczas uploadu pliku przez SFTP.
+        Aktualizuje progress bar i status.
+        """
+        if total > 0:
+            percent = (transferred / total) * 100
+            
+            # Aktualizuj progress bar
+            self.upload_progress['value'] = percent
+            
+            # Oblicz rozmiary w MB
+            transferred_mb = transferred / 1024 / 1024
+            total_mb = total / 1024 / 1024
+            
+            # Formatuj status
+            status_text = f"📤 {filename}: {transferred_mb:.1f} MB / {total_mb:.1f} MB ({percent:.1f}%)"
+            
+            # Aktualizuj GUI (thread-safe)
+            self.after(0, lambda: self.upload_status_label.config(
+                text=status_text, 
+                fg="blue"
+            ))
+            
+            # Log co 10%
+            if int(percent) % 10 == 0 and int(percent) > 0:
+                self.log(f"  📊 Upload: {percent:.0f}% ({transferred_mb:.1f}/{total_mb:.1f} MB)")
+
+    def reset_upload_progress(self):
+        """Resetuje progress bar po zakończeniu uploadu."""
+        self.after(0, lambda: self.upload_progress.config(value=0))
+        self.after(0, lambda: self.upload_status_label.config(
+            text="Oczekiwanie na transfer...",
+            fg="gray"
+        ))
+
+
+
+    def process_batch(self, operation):
+        """
+        Główna metoda przetwarzania wsadowego.
+        operation: "read", "system_services", "timezone", "firmware", "all"
+        """
+        self.processing = True
+        self.stop_btn.config(state="normal")
+        
+        total = len(self.devices)
+        success_count = 0
+        failed_count = 0
+        
+        self.log(f"{'='*60}")
+        self.log(f"🚀 START OPERACJI WSADOWEJ: {operation.upper()}")
+        self.log(f"📊 Liczba sterowników: {total}")
+        self.log(f"{'='*60}")
+        
+        for idx, device in enumerate(self.devices, 1):
+            if not self.processing:
+                self.log("⏹️  Operacja zatrzymana przez użytkownika")
+                break
+            
+            self.log(f"\n{'='*60}")
+            self.log(f"[{idx}/{total}] 🔧 Przetwarzanie: {device.name} ({device.ip})")
+            self.log(f"{'='*60}")
+            
+            device.status = "W trakcie..."
+            device.error_log = ""
+            self.after(0, lambda d=device: self.update_device_row(d))
+            
+            attempt = 0
+            success = False
+            
+            while attempt < RETRY_ATTEMPTS and not success:
+                attempt += 1
+                
+                if attempt > 1:
+                    self.log(f"⚠️  Próba {attempt}/{RETRY_ATTEMPTS}")
+                    time.sleep(RETRY_DELAY)
+                
+                try:
+                    if operation == "read":
+                        self.read_single_device(device)
+                        success = True
+                        
+                    elif operation == "system_services":
+                        self.update_system_services_only(device)
+                        success = True
+                        
+                    elif operation == "timezone":
+                        self.update_timezone_only(device)
+                        success = True
+                        
+                    elif operation == "firmware":
+                        self.update_firmware_only_operation(device)
+                        success = True
+                        
+                    elif operation == "all":
+                        self.update_all_operations(device)
+                        success = True
+                    
+                    if success:
+                        device.status = "✓ OK"
+                        success_count += 1
+                        self.log(f"✓ [{device.name}] Operacja zakończona sukcesem")
+                        
+                except Exception as e:
+                    error_msg = str(e)
+                    device.error_log = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {error_msg}"
+                    
+                    if attempt < RETRY_ATTEMPTS:
+                        self.log(f"✗ Błąd (próba {attempt}/{RETRY_ATTEMPTS}): {error_msg}")
+                    else:
+                        device.status = "✗ Błąd"
+                        failed_count += 1
+                        self.log(f"✗ [{device.name}] Operacja nieudana po {RETRY_ATTEMPTS} próbach: {error_msg}")
+                
+                finally:
+                    self.after(0, lambda d=device: self.update_device_row(d))
+        
+        # Podsumowanie
+        self.log(f"\n{'='*60}")
+        self.log(f"📊 PODSUMOWANIE OPERACJI: {operation.upper()}")
+        self.log(f"{'='*60}")
+        self.log(f"✓ Sukces: {success_count}/{total}")
+        self.log(f"✗ Błędy: {failed_count}/{total}")
+        self.log(f"{'='*60}\n")
+        
+        self.processing = False
+        self.stop_btn.config(state="disabled")
+        self.status_bar.config(text="Gotowy")
+        
+        # Pokaż podsumowanie
+        self.after(0, lambda: messagebox.showinfo(
+            "Operacja zakończona",
+            f"Operacja: {operation.upper()}\n\n"
+            f"✓ Sukces: {success_count}/{total}\n"
+            f"✗ Błędy: {failed_count}/{total}\n\n"
+            f"Sprawdź logi, aby uzyskać szczegóły."
+        ))
+
+
+    def read_single_device(self, device):
+        """
+        Odczytuje dane z pojedynczego sterownika.
+        """
+        try:
+            with self.ssh_connection(device) as (ssh, sftp):
+                
+                # 1. Wykryj model PLC
+                device.plc_model = self.detect_plc_model(ssh)
+                
+                # 2. Wersja Firmware
+                stdin, stdout, stderr = ssh.exec_command("grep Arpversion /etc/plcnext/arpversion")
+                fw_output = stdout.read().decode().strip()
+                
+                self.log(f"  🔍 Surowy output wersji firmware: '{fw_output}'")
+                
+                version_string = "?"
+                if fw_output:
+                    fw_output = fw_output.replace('Arpversion', '').strip()
+                    
+                    if ":" in fw_output:
+                        parts = fw_output.split(':', 1)
+                        version_string = parts[1].strip() if len(parts) > 1 else "?"
+                    elif "=" in fw_output:
+                        version_string = fw_output.split("=")[-1].strip()
+                    else:
+                        version_string = fw_output.strip()
+                    
+                    self.log(f"  🔍 Sparsowana wersja: '{version_string}'")
+                
+                if version_string and version_string != "?" and version_string[0].isdigit():
+                    device.firmware_version = version_string
+                else:
+                    device.firmware_version = "?"
+                    self.log(f"  ⚠️  Nie można odczytać poprawnej wersji firmware!")
+                
+                # 3. Strefa czasowa
+                stdin, stdout, stderr = ssh.exec_command("cat /etc/timezone")
+                device.timezone = stdout.read().decode(errors="ignore").strip()
+                
+                # 4. Sprawdzenie synchronizacji czasu
+                plc_time_obj, plc_time_str, is_synced = self.check_time_sync(ssh)
+                device.plc_time = plc_time_str
+                device.time_sync_error = not is_synced
+                
+                # 5. System Services
+                try:
+                    remote_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
+                    remote_stat = sftp.stat(remote_path)
+                    
+                    local_file = resource_path(SYSTEM_SERVICES_FILE)
+                    if os.path.exists(local_file):
+                        local_size = os.path.getsize(local_file)
+                        remote_size = remote_stat.st_size
+                        
+                        if local_size == remote_size:
+                            device.system_services_ok = "OK"
+                        else:
+                            device.system_services_ok = "Różnica"
+                            self.log(f"  ⚠️  System Services - różnica rozmiaru: lokalny={local_size}, zdalny={remote_size}")
+                    else:
+                        device.system_services_ok = "Istnieje"
+                        
+                except FileNotFoundError:
+                    device.system_services_ok = "Brak"
+                    self.log(f"  ⚠️  Plik System Services nie istnieje na sterowniku")
+                except Exception as e:
+                    device.system_services_ok = "Błąd"
+                    self.log(f"  ⚠️  Błąd sprawdzania System Services: {str(e)}")
+                
+                # 6. Znacznik czasowy odczytu
+                device.last_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Logowanie podsumowania
+                self.log(f"  📦 Model: AXC F {device.plc_model}")
+                self.log(f"  📦 Firmware: {device.firmware_version}")
+                self.log(f"  🕐 Czas PLC: {device.plc_time}")
+                self.log(f"  🌍 Strefa czasowa: {device.timezone}")
+                self.log(f"  ⚙️  System Services: {device.system_services_ok}")
+                
+            # Context manager automatycznie zamknie SSH/SFTP tutaj
+            
+        except Exception as e:
+            raise e
+
+
+
+
     def detect_plc_model(self, ssh):
         """
         Wykrywa model sterownika PLC za pomocą komendy 'rauc status'.
@@ -138,12 +545,16 @@ class BatchProcessorApp(tk.Tk):
     def check_time_sync(self, ssh):
         """
         Sprawdza czy czas sterownika jest zsynchronizowany z czasem systemowym.
-        Zwraca (datetime_object, is_synced) gdzie is_synced=True jeśli różnica < 60s.
+        Zwraca (datetime_object, time_string, is_synced).
         """
         try:
-            # Pobierz czas z sterownika
-            stdin, stdout, stderr = ssh.exec_command("date '+%Y-%m-%d %H:%M:%S'")
+            # Pobierz czas z sterownika z timeoutem
+            stdin, stdout, stderr = ssh.exec_command("date '+%Y-%m-%d %H:%M:%S'", timeout=10)
             plc_time_str = stdout.read().decode(errors="ignore").strip()
+            
+            if not plc_time_str:
+                self.log(f"  ⚠️ Nie można odczytać czasu ze sterownika")
+                return None, "", False
             
             # Parsuj czas sterownika
             plc_time = datetime.strptime(plc_time_str, "%Y-%m-%d %H:%M:%S")
@@ -159,36 +570,68 @@ class BatchProcessorApp(tk.Tk):
             is_synced = time_diff < 60
             
             if not is_synced:
-                self.log(f"  ⚠️  DESYNCHRONIZACJA CZASU: różnica {time_diff:.0f}s")
-                self.log(f"      Sterownik: {plc_time_str}")
-                self.log(f"      Lokalny: {local_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                self.log(f"  ⚠️ DESYNCHRONIZACJA CZASU: różnica {time_diff:.0f}s")
+                self.log(f"    Sterownik: {plc_time_str}")
+                self.log(f"    Lokalny: {local_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
             return plc_time, plc_time_str, is_synced
             
         except Exception as e:
-            self.log(f"  ⚠️  Błąd sprawdzania czasu: {str(e)}")
+            self.log(f"  ⚠️ Błąd sprawdzania czasu: {str(e)}")
             return None, "", False
 
     def compare_firmware_versions(self, current_version, target_version):
         """
-        Porównuje wersje firmware. Zwraca True, jeśli current_version jest
-        identyczna z numerem wersji wyodrębnionym z nazwy pliku target_version.
+        Porównuje wersje firmware ze szczegółowym logowaniem.
+        Zwraca True jeśli wersje są IDENTYCZNE (nie trzeba aktualizować).
         """
         target_version_number = self.get_target_fw_version(target_version)
+        
+        self.log(f"  🔍 Porównanie wersji firmware:")
+        self.log(f"     Aktualna wersja na sterowniku: '{current_version}'")
+        self.log(f"     Wersja z pliku firmware: '{target_version_number}'")
+        
         if not current_version or current_version == "?":
+            self.log(f"     ⚠️  Nie można odczytać aktualnej wersji - wymuszam aktualizację")
             return False 
-            
-        # Porównanie bezpośrednie numerów wersji
-        return current_version.strip() == target_version_number.strip()
+        
+        if not target_version_number:
+            self.log(f"     ⚠️  Nie można odczytać wersji z pliku - wymuszam aktualizację")
+            return False
+        
+        # Normalizacja: usuń białe znaki i porównaj
+        current_clean = current_version.strip()
+        target_clean = target_version_number.strip()
+        
+        is_same = current_clean == target_clean
+        
+        if is_same:
+            self.log(f"     ✅ Wersje są IDENTYCZNE - aktualizacja NIE jest potrzebna")
+        else:
+            self.log(f"     ⚠️  Wersje są RÓŻNE - aktualizacja jest potrzebna")
+            self.log(f"        Różnica: '{current_clean}' != '{target_clean}'")
+        
+        return is_same
     
     def get_target_fw_version(self, firmware_path):
-        """Wyodrębnia sam numer wersji z nazwy pliku firmware."""
+        """Wyodrębnia numer wersji z nazwy pliku firmware."""
         # Przykład: 'axcf2152-2024.0.8_LTS-24.0.8.183.raucb' -> '24.0.8.183'
         filename = os.path.basename(firmware_path)
+        
+        # Usuń rozszerzenie .raucb
+        if filename.endswith('.raucb'):
+            filename = filename[:-6]
+        
+        # Podziel po myślniku
         parts = filename.split('-')
-        if len(parts) > 2:
-            version_part = parts[-1].split('.')[0:-1] # Usuń '.raucb'
-            return ".".join(version_part)
+        
+        # Ostatnia część to wersja (np. '24.0.8.183')
+        if len(parts) >= 3:
+            version = parts[-1]
+            self.log(f"  🔍 Wykryta wersja firmware z pliku: {version}")
+            return version
+        
+        self.log(f"  ⚠️  Nie można odczytać wersji z nazwy pliku: {filename}")
         return ""
 
     def create_widgets(self):
@@ -267,6 +710,28 @@ class BatchProcessorApp(tk.Tk):
         btn_grid.columnconfigure(0, weight=1)
         btn_grid.columnconfigure(1, weight=1)
         
+        progress_frame = tk.LabelFrame(batch_frame, text="Status transferu plików", padx=10, pady=5)
+        progress_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Progress bar
+        self.upload_progress = ttk.Progressbar(
+            progress_frame, 
+            orient="horizontal", 
+            length=100, 
+            mode="determinate"
+        )
+        self.upload_progress.pack(fill="x", padx=5, pady=5)
+        
+        # Label ze statusem
+        self.upload_status_label = tk.Label(
+            progress_frame, 
+            text="Oczekiwanie na transfer...",
+            font=("Arial", 9),
+            fg="gray"
+        )
+        self.upload_status_label.pack(padx=5, pady=2)
+    
+
         control_frame = tk.Frame(batch_frame)
         control_frame.pack(fill="x", padx=10, pady=5)
 
@@ -530,20 +995,22 @@ class BatchProcessorApp(tk.Tk):
             self.log(f"✗ Błąd zapisu Excel: {str(e)}")
             messagebox.showerror("Błąd", f"Błąd zapisu do Excel:\n{str(e)}")
 
-
     def update_firmware_only_operation(self, device):
         """
         Aktualizuje TYLKO firmware (z automatycznym wykrywaniem modelu i walidacją).
+        POPRAWIONA: Używa execute_firmware_update() dla bezpiecznego reebootu.
         """
         self.log(f"📦 Aktualizacja Firmware...")
         
         firmware_file = self.firmware_path.get()
         
-        # Odczyt danych (w tym model PLC)
+        # Odczyt danych (w tym model PLC) - PRZERWIJ jeśli błąd
         try:
             self.read_single_device(device)
         except Exception as e:
-            self.log(f"  ⚠️  Błąd odczytu przed aktualizacją FW: {str(e)}")
+            error_msg = f"Nie można odczytać danych sterownika przed aktualizacją: {str(e)}"
+            self.log(f"  ❌ {error_msg}")
+            raise Exception(error_msg)
         
         # Walidacja kompatybilności
         is_compatible, compat_msg = self.validate_firmware_compatibility(device, firmware_file)
@@ -554,49 +1021,47 @@ class BatchProcessorApp(tk.Tk):
         
         # Sprawdź czy firmware jest aktualny
         if self.compare_firmware_versions(device.firmware_version, firmware_file):
-            self.log(f"  ℹ️  Firmware już aktualny - pomijam")
+            self.log(f"  ✅ Firmware już aktualny (v.{device.firmware_version}) - pomijam aktualizację")
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return True
         
-        ssh = None
-        sftp = None
-        
         try:
-            # Połącz
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(device.ip, username=PLC_USER, password=device.password, timeout=30)
-            sftp = ssh.open_sftp()
+            # ✅ KROK 1: UPLOAD FIRMWARE (w context managerze)
+            with self.ssh_connection(device) as (ssh, sftp):
+                
+                filename = os.path.basename(firmware_file)
+                remote_fw_path = f"/opt/plcnext/{filename}"
+                
+                file_size = os.path.getsize(firmware_file)
+                self.log(f"  📤 Wysyłanie firmware ({file_size/1024/1024:.1f} MB)...")
+                
+                sftp.put(
+                    firmware_file, 
+                    remote_fw_path,
+                    callback=lambda transferred, total: self.upload_callback(
+                        filename, transferred, total
+                    )
+                )
+                
+                self.reset_upload_progress()
+                
+                # Weryfikacja rozmiaru
+                remote_size = sftp.stat(remote_fw_path).st_size
+                if remote_size != file_size:
+                    raise Exception(f"Transfer niepełny! Lokalny: {file_size}, Zdalny: {remote_size}")
+                
+                self.log(f"  ✓ Firmware wysłany i zweryfikowany")
             
-            # Wyślij firmware
-            filename = os.path.basename(firmware_file)
-            remote_fw_path = f"/opt/plcnext/{filename}"
-            self.log(f"  📤 Wysyłanie firmware...")
-            sftp.put(firmware_file, remote_fw_path)
-            self.log(f"  ✓ Firmware wysłany")
+            # ✅ Context manager zamknął SSH/SFTP tutaj
             
-            sftp.close()
+            # ✅ KROK 2: WYKONAJ UPDATE (NOWE połączenie SSH)
+            self.execute_firmware_update(device)
             
-            # Użyj wykrytego modelu do komendy update
-            update_command = f"sudo update-axcf{device.plc_model}"
-            self.log(f"  🔄 Wykonywanie: {update_command}")
-            
-            stdin, stdout, stderr = ssh.exec_command(update_command, get_pty=True)
-            stdin.write(device.password + "\n")
-            stdin.flush()
-            time.sleep(1)
-            
-            ssh.close()
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.log(f"  ✓ Aktualizacja firmware rozpoczęta (auto-restart)")
-            
             return True
             
         except Exception as e:
-            if sftp:
-                sftp.close()
-            if ssh:
-                ssh.close()
+            self.reset_upload_progress()
             raise e
 
 
@@ -706,588 +1171,343 @@ class BatchProcessorApp(tk.Tk):
             threading.Thread(target=self.process_batch, args=("all",), daemon=True).start()
 
 
-    
-
     def update_system_services_only(self, device):
         """
         Wysyła System Services i restartuje sterownik. Pomija, jeśli jest już OK.
+        POPRAWIONA: Używa execute_reboot() dla bezpiecznego reebootu.
         """
         self.log(f"⚙️  Aktualizacja System Services...")
         
-        # 1. Sprawdzenie statusu przed operacją
-        # Najpierw spróbuj odczytać stan urządzenia
+        # Sprawdzenie statusu przed operacją
         try:
             self.read_single_device(device)
         except Exception as e:
             self.log(f"  ⚠️  Błąd odczytu przed aktualizacją SysServices: {str(e)}")
-            # Kontynuuj, ponieważ błąd odczytu nie powinien zatrzymać próby wgrania
-            # Jeśli odczyt się nie powiedzie, system_services_ok będzie pusty.
-
-        # 2. Logika pominięcia wgrywania/restartu
+        
+        # Logika pominięcia
         if device.system_services_ok == "OK":
             self.log(f"  ℹ️  System Services już aktualne - pomijam")
-            # Ustaw status na OK, ponieważ odczyt był pomyślny lub pominięty
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            return True # Pomyślnie zakończona operacja (przez pominięcie)
-        
-        # Dalsza część kodu pozostaje bez zmian:
-        ssh = None
-        sftp = None
+            return True
         
         try:
-            # Połącz
-            ssh = paramiko.SSHClient()
-            # ... pozostała część kodu jest taka sama (łącz, wyślij, reboot) ...
+            # ✅ KROK 1: UPLOAD SYSTEM SERVICES (w context managerze)
+            with self.ssh_connection(device) as (ssh, sftp):
+                
+                local_sys_file = resource_path(SYSTEM_SERVICES_FILE)
+                if not os.path.exists(local_sys_file):
+                    raise Exception(f"Plik {SYSTEM_SERVICES_FILE} nie istnieje!")
+                
+                remote_sys_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
+                filename = os.path.basename(local_sys_file)
+                file_size = os.path.getsize(local_sys_file)
+                
+                self.log(f"  📤 Wysyłanie {filename} ({file_size/1024:.1f} KB)...")
+                
+                sftp.put(
+                    local_sys_file, 
+                    remote_sys_path,
+                    callback=lambda transferred, total: self.upload_callback(
+                        filename, transferred, total
+                    )
+                )
+                
+                self.reset_upload_progress()
+                
+                # Weryfikacja
+                remote_size = sftp.stat(remote_sys_path).st_size
+                if file_size != remote_size:
+                    raise Exception(f"Transfer niepełny! Lokalny: {file_size}, Zdalny: {remote_size}")
+                
+                device.system_services_ok = "OK"
+                self.log(f"  ✓ System Services wysłane i zweryfikowane")
             
-            # Połącz ponownie
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(device.ip, username=PLC_USER, password=device.password, timeout=30)
-            sftp = ssh.open_sftp()
+            # ✅ Context manager zamknął SSH/SFTP tutaj
             
-            # Wyślij System Services
-            local_sys_file = resource_path(SYSTEM_SERVICES_FILE)
-            if not os.path.exists(local_sys_file):
-                raise Exception(f"Plik {SYSTEM_SERVICES_FILE} nie istnieje!")
+            # ✅ KROK 2: REBOOT (NOWE połączenie SSH)
+            self.execute_reboot(device)
             
-            remote_sys_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
-            self.log(f"  📤 Wysyłanie {SYSTEM_SERVICES_FILE}...")
-            sftp.put(local_sys_file, remote_sys_path)
-            device.system_services_ok = "OK" # Zakładamy sukces po wgraniu
-            self.log(f"  ✓ System Services wysłane")
-            
-            sftp.close()
-            
-            # RESTART STEROWNIKA
-            self.log(f"  🔄 Restartowanie sterownika...")
-            stdin, stdout, stderr = ssh.exec_command("sudo reboot", get_pty=True)
-            stdin.write(device.password + "\n")
-            stdin.flush()
-            time.sleep(2)
-            
-            ssh.close()
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.log(f"  ✓ Sterownik restartuje się")
-            
             return True
             
         except Exception as e:
-            if sftp:
-                sftp.close()
-            if ssh:
-                ssh.close()
+            self.reset_upload_progress()
             raise e
+
 
     def update_timezone_only(self, device):
         """
         Ustawia strefę czasową i restartuje. Pomija, jeśli już OK.
-        UŻYWA SU I ROOT - jak w wersji pojedynczej.
+        POPRAWIONA: Używa execute_reboot() dla bezpiecznego reebootu.
         """
         self.log(f"🕐 Aktualizacja strefy czasowej na {TIMEZONE}...")
         
-        # 1. Sprawdzenie statusu przed operacją
+        # Sprawdzenie statusu przed operacją
         try:
             self.read_single_device(device)
         except Exception as e:
-            self.log(f"  ⚠️  Błąd odczytu przed aktualizacją Timezone: {str(e)}. Kontynuuję próbę ustawienia.")
-
-        # 2. Logika pominięcia
+            self.log(f"  ⚠️  Błąd odczytu przed aktualizacją Timezone: {str(e)}")
+        
+        # Logika pominięcia
         if device.timezone.strip() == TIMEZONE.strip():
-            self.log(f"  ℹ️  Strefa czasowa już ustawiona na {TIMEZONE} - pomijam wysyłkę i restart")
+            self.log(f"  ℹ️  Strefa czasowa już ustawiona na {TIMEZONE} - pomijam")
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            return True 
-
-        ssh = None
+            return True
         
         try:
-            # 3. Połącz
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(device.ip, username=PLC_USER, password=device.password, timeout=30)
+            # ✅ KROK 1: USTAWIENIE TIMEZONE (w context managerze)
+            with self.ssh_connection(device) as (ssh, sftp):
+                
+                self.log(f"  📝 Ustawianie strefy czasowej na {TIMEZONE}...")
+                
+                # Wpisanie TIMEZONE do /etc/timezone
+                stdin, stdout, stderr = ssh.exec_command(
+                    f"sudo sh -c 'echo {TIMEZONE} > /etc/timezone'", 
+                    get_pty=True
+                )
+                stdin.write(device.password + "\n")
+                stdin.flush()
+                time.sleep(1)
+                
+                # Użycie timedatectl
+                stdin, stdout, stderr = ssh.exec_command(
+                    f"sudo timedatectl set-timezone {TIMEZONE}", 
+                    get_pty=True
+                )
+                stdin.write(device.password + "\n")
+                stdin.flush()
+                time.sleep(1)
+                
+                device.timezone = TIMEZONE
+                self.log("  ✓ Strefa czasowa ustawiona")
             
-            self.log(f"  📝 Ustawianie strefy czasowej na {TIMEZONE}...")
+            # ✅ Context manager zamknął SSH/SFTP tutaj
             
-            # UŻYJ METODY Z SU (jak w pojedynczym sterowniku)
-            shell = ssh.invoke_shell()
-            
-            def send_cmd(cmd, wait=1):
-                shell.send(cmd + "\n")
-                time.sleep(wait)
-            
-            # Ustaw hasło root
-            send_cmd("sudo passwd root")
-            send_cmd(device.password)  # sudo password (admin)
-            send_cmd(ROOT_PASS)        # nowe hasło root
-            send_cmd(ROOT_PASS)        # potwierdzenie
-            
-            # Przełącz na root
-            send_cmd("su")
-            send_cmd(ROOT_PASS)
-            
-            # Ustaw strefę czasową
-            send_cmd(f"ln -sf /usr/share/zoneinfo/{TIMEZONE} /etc/localtime")
-            send_cmd(f"echo '{TIMEZONE}' > /etc/timezone")
-            
-            # Wyłącz hasło root (bezpieczeństwo)
-            send_cmd("passwd -dl root")
-            send_cmd("exit")
-            
-            # Restart
-            send_cmd("sudo reboot")
-            send_cmd(device.password)
-            
-            time.sleep(3)
-            
-            device.timezone = TIMEZONE
-            ssh.close()
+            # ✅ KROK 2: REBOOT (NOWE połączenie SSH)
+            self.execute_reboot(device)
             
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.log(f"  ✓ Strefa czasowa ustawiona. Sterownik restartuje się.")
-            
             return True
             
         except Exception as e:
-            if ssh:
-                try:
-                    ssh.close()
-                except:
-                    pass
             raise e
-
-
-    def read_single_device(self, device):
-        """Odczytuje dane z pojedynczego urządzenia (z wykrywaniem modelu i synchronizacją czasu)."""
-        self.log(f"📖 Odczyt danych...")
-        ssh = None
-        sftp = None
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(device.ip, username=PLC_USER, password=device.password, timeout=15)
-            sftp = ssh.open_sftp()
-
-            # Wykryj model sterownika
-            device.plc_model = self.detect_plc_model(ssh)
-
-            # Sprawdź synchronizację czasu
-            plc_datetime, plc_time_str, time_is_synced = self.check_time_sync(ssh)
-            device.time_sync_error = not time_is_synced
-            device.plc_time = plc_time_str
-
-            # Odczyt strefy czasowej
-            stdin, stdout, stderr = ssh.exec_command("cat /etc/timezone")
-            device.timezone = stdout.read().decode(errors="ignore").strip()
-            self.log(f"  🕐 Strefa czasowa: {device.timezone}")
-            
-            # Odczyt wersji firmware
-            stdin, stdout, stderr = ssh.exec_command("grep Arpversion /etc/plcnext/arpversion")
-            fw_output = stdout.read().decode().strip()
-            
-            version_string = "?"
-            
-            if fw_output:
-                if ":" in fw_output:
-                    parts = fw_output.split(':', 1) 
-                    version_string = parts[1].strip() if len(parts) > 1 else "?"
-                elif "=" in fw_output:
-                    version_string = fw_output.split("=")[-1].strip()
-                else:
-                    version_string = fw_output.strip()
-
-            if version_string != "?" and version_string and version_string[0].isdigit():
-                device.firmware_version = version_string
-            else:
-                device.firmware_version = "?"
-                
-            self.log(f"  📦 Firmware: {device.firmware_version}")
-            
-            # Sprawdzenie System Services
-            try:
-                remote_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
-                remote_stat = sftp.stat(remote_path)
-                
-                local_file = resource_path(SYSTEM_SERVICES_FILE)
-                if os.path.exists(local_file):
-                    local_size = os.path.getsize(local_file)
-                    remote_size = remote_stat.st_size
-                    device.system_services_ok = "OK" if local_size == remote_size else "Różnica"
-                else:
-                    device.system_services_ok = "Istnieje"
-            except:
-                device.system_services_ok = "Brak"
-            
-            self.log(f"  ⚙️  System Services: {device.system_services_ok}")
-            
-            sftp.close()
-            device.last_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ssh.close()
-            return True
-            
-        except Exception as e:
-            if sftp:
-                try:
-                    sftp.close()
-                except:
-                    pass
-            if ssh:
-                try:
-                    ssh.close()
-                except:
-                    pass
-            raise e
-
-    def process_batch(self, operation_type):
-        """
-        Główna funkcja przetwarzania wsadowego.
-        
-        operation_type:
-        - "read" - tylko odczyt
-        - "system_services" - tylko System Services + restart
-        - "timezone" - tylko strefa czasowa + restart
-        - "firmware" - tylko firmware + sudo update (auto-restart)
-        - "all" - wszystko naraz (zoptymalizowane restarty)
-        """
-        self.processing = True
-        self.stop_btn.config(state="normal")
-        
-        operation_names = {
-            "read": "Odczyt danych",
-            "system_services": "Aktualizacja System Services",
-            "timezone": "Ustawienie strefy czasowej",
-            "firmware": "Aktualizacja Firmware",
-            "all": "PEŁNA AKTUALIZACJA (wszystko)"
-        }
-        
-        operation_name = operation_names.get(operation_type, operation_type)
-        
-        self.log(f"\n{'='*80}")
-        self.log(f"🚀 START: {operation_name}")
-        self.log(f"   Liczba sterowników: {len(self.devices)}")
-        if operation_type in ["firmware", "all"]:
-            self.log(f"   Plik firmware: {os.path.basename(self.firmware_path.get())}")
-        self.log(f"{'='*80}\n")
-        
-        start_time = time.time()
-        success_count = 0
-        error_count = 0
-        
-        for i, device in enumerate(self.devices):
-            if not self.processing:
-                self.log("⏹ Operacja zatrzymana przez użytkownika")
-                break
-            
-            self.status_bar.config(text=f"[{i+1}/{len(self.devices)}] {device.name}")
-            self.log(f"\n{'─'*80}")
-            self.log(f"[{i+1}/{len(self.devices)}] 🔧 {device.name} ({device.ip})")
-            self.log(f"{'─'*80}")
-            
-            device.status = "W trakcie..."
-            self.update_device_row(device)
-            
-            # Próby z retry
-            success = False
-            for attempt in range(RETRY_ATTEMPTS):
-                try:
-                    if operation_type == "read":
-                        success = self.read_single_device(device)
-                    elif operation_type == "system_services":
-                        success = self.update_system_services_only(device)
-                    elif operation_type == "timezone":
-                        success = self.update_timezone_only(device)
-                    elif operation_type == "firmware":
-                        success = self.update_firmware_only_operation(device)
-                    elif operation_type == "all":
-                        success = self.update_all_operations(device)
-                    
-                    if success:
-                        device.status = "✓ OK"
-                        device.error_log = ""
-                        success_count += 1
-                        self.log(f"✅ SUKCES")
-                        break
-                    else:
-                        raise Exception("Operacja nieudana")
-                        
-                except Exception as e:
-                    error_msg = str(e)
-                    if attempt < RETRY_ATTEMPTS - 1:
-                        self.log(f"⚠️  Próba {attempt+1}/{RETRY_ATTEMPTS} nieudana: {error_msg}")
-                        self.log(f"⏳ Ponowna próba za {RETRY_DELAY}s...")
-                        time.sleep(RETRY_DELAY)
-                    else:
-                        device.status = "✗ Błąd"
-                        device.error_log = f"{datetime.now().strftime('%H:%M:%S')}: {error_msg}"
-                        error_count += 1
-                        self.log(f"❌ BŁĄD po {RETRY_ATTEMPTS} próbach: {error_msg}")
-            
-            self.update_device_row(device)
-            
-            # Przerwa między urządzeniami (dłuższa po operacjach z restartem)
-            if operation_type in ["system_services", "timezone", "firmware", "all"] and success:
-                self.log(f"⏳ Oczekiwanie na restart sterownika (30s)...")
-                time.sleep(30)
-            else:
-                time.sleep(2)
-        
-        elapsed = time.time() - start_time
-        self.log(f"\n{'='*80}")
-        self.log(f"📊 PODSUMOWANIE: {operation_name}")
-        self.log(f"{'='*80}")
-        self.log(f"⏱️  Czas trwania: {elapsed/60:.1f} min ({elapsed:.0f}s)")
-        self.log(f"✅ Sukces: {success_count}/{len(self.devices)}")
-        self.log(f"❌ Błędy: {error_count}/{len(self.devices)}")
-        if success_count + error_count < len(self.devices):
-            self.log(f"⏹️  Przerwane: {len(self.devices) - success_count - error_count}")
-        self.log(f"{'='*80}\n")
-        
-        self.processing = False
-        self.stop_btn.config(state="disabled")
-        self.status_bar.config(text="Gotowy")
-        
-        messagebox.showinfo(
-            "Zakończono",
-            f"✅ Operacja zakończona!\n\n"
-            f"Operacja: {operation_name}\n"
-            f"Sukces: {success_count}/{len(self.devices)}\n"
-            f"Błędy: {error_count}/{len(self.devices)}\n"
-            f"Czas: {elapsed/60:.1f} min\n\n"
-            f"💾 Zapisz raport do Excel aby zachować wyniki."
-        )
 
     def update_all_operations(self, device):
         """
         Wykonuje wszystkie operacje: System Services, Firmware, Timezone.
-        POPRAWIONA - bez duplikacji odczytu, z prawidłową obsługą update.
+        Zoptymalizowane pod kątem restartów i pomijania.
+        
+        KOLEJNOŚĆ OPERACJI:
+        1. Połączenie SSH (przez context manager)
+        2. Wykrycie modelu PLC i walidacja kompatybilności firmware
+        3. Odczyt wstępny (stan SysServices, Timezone, Firmware)
+        4. Aktualizacja System Services (tylko jeśli jest różnica/brak)
+        5. Aktualizacja Firmware (tylko wysłanie pliku - jeśli konieczne i kompatybilne)
+        6. Ustawienie strefy czasowej (tylko jeśli konieczne)
+        7. ZAMKNIĘCIE SFTP przed rebootem/update
+        8. Wykonanie sudo update / sudo reboot (tylko jeśli FW lub SS było wgrywane)
         """
         self.log(f"🚀 PEŁNA AKTUALIZACJA: START")
         
         firmware_file = self.firmware_path.get()
         
-        ssh = None
-        sftp = None
-        
+        # Flagi kontrolujące potrzebę restartu/update
         ss_updated = False
         fw_needed = False
+        tz_updated = False
         
         try:
-            # 1. Połączenie SSH
-            self.log("  🔗 Łączenie SSH...")
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(device.ip, username=PLC_USER, password=device.password, timeout=30)
-            sftp = ssh.open_sftp()
-            self.log("  ✓ Połączono.")
-            
-            # 2. Wykryj model PLC
-            device.plc_model = self.detect_plc_model(ssh)
-            
-            # 3. Walidacja kompatybilności firmware
-            is_compatible, compat_msg = self.validate_firmware_compatibility(device, firmware_file)
-            self.log(f"  🔍 {compat_msg}")
-            
-            if not is_compatible:
-                raise Exception(compat_msg)
-            
-            # 4. Odczyt wstępny - BEZPOŚREDNIO przez SSH (NIE przez read_single_device!)
-            self.log("  📖 Wstępny odczyt danych...")
-            
-            # Firmware
-            stdin, stdout, stderr = ssh.exec_command("grep Arpversion /etc/plcnext/arpversion")
-            fw_output = stdout.read().decode().strip()
-            version_string = "?"
-            if fw_output:
-                if ":" in fw_output:
-                    parts = fw_output.split(':', 1) 
-                    version_string = parts[1].strip() if len(parts) > 1 else "?"
-                elif "=" in fw_output:
-                    version_string = fw_output.split("=")[-1].strip()
+            # ✅ UŻYJ CONTEXT MANAGERA dla bezpiecznego SSH/SFTP
+            with self.ssh_connection(device) as (ssh, sftp):
+                
+                # 1. Wykryj model PLC
+                device.plc_model = self.detect_plc_model(ssh)
+                
+                if not device.plc_model:
+                    raise Exception("❌ Nie można wykryć modelu sterownika!")
+                
+                # 2. Walidacja kompatybilności firmware
+                is_compatible, compat_msg = self.validate_firmware_compatibility(device, firmware_file)
+                self.log(f"  🔍 {compat_msg}")
+                
+                if not is_compatible:
+                    raise Exception(f"❌ {compat_msg}\n\n⚠️ ZATRZYMANO AKTUALIZACJĘ!")
+                
+                # 3. Odczyt wstępny danych
+                self.log("  📖 Wstępny odczyt danych...")
+                
+                # Firmware version
+                stdin, stdout, stderr = ssh.exec_command("grep Arpversion /etc/plcnext/arpversion")
+                fw_output = stdout.read().decode().strip()
+                
+                self.log(f"  🔍 Surowy output wersji firmware: '{fw_output}'")
+                
+                version_string = "?"
+                if fw_output:
+                    fw_output = fw_output.replace('Arpversion', '').strip()
+                    
+                    if ":" in fw_output:
+                        parts = fw_output.split(':', 1) 
+                        version_string = parts[1].strip() if len(parts) > 1 else "?"
+                    elif "=" in fw_output:
+                        version_string = fw_output.split("=")[-1].strip()
+                    else:
+                        version_string = fw_output.strip()
+                    
+                    self.log(f"  🔍 Sparsowana wersja: '{version_string}'")
+                
+                if version_string and version_string != "?" and version_string[0].isdigit():
+                    device.firmware_version = version_string
                 else:
-                    version_string = fw_output.strip()
-            if version_string != "?" and version_string and version_string[0].isdigit():
-                device.firmware_version = version_string
-            else:
-                device.firmware_version = "?"
-            
-            # Timezone
-            stdin, stdout, stderr = ssh.exec_command("cat /etc/timezone")
-            device.timezone = stdout.read().decode(errors="ignore").strip()
-            
-            # System Services
-            try:
-                remote_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
-                remote_stat = sftp.stat(remote_path)
-                local_file = resource_path(SYSTEM_SERVICES_FILE)
-                if os.path.exists(local_file):
-                    local_size = os.path.getsize(local_file)
-                    remote_size = remote_stat.st_size
-                    device.system_services_ok = "OK" if local_size == remote_size else "Różnica"
+                    device.firmware_version = "?"
+                    self.log(f"  ⚠️ Nie można odczytać poprawnej wersji firmware!")
+                
+                # Timezone
+                stdin, stdout, stderr = ssh.exec_command("cat /etc/timezone")
+                device.timezone = stdout.read().decode(errors="ignore").strip()
+                
+                # System Services
+                try:
+                    remote_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
+                    remote_stat = sftp.stat(remote_path)
+                    local_file = resource_path(SYSTEM_SERVICES_FILE)
+                    if os.path.exists(local_file):
+                        local_size = os.path.getsize(local_file)
+                        remote_size = remote_stat.st_size
+                        device.system_services_ok = "OK" if local_size == remote_size else "Różnica"
+                        if device.system_services_ok == "Różnica":
+                            self.log(f"  ⚠️ System Services - różnica rozmiaru: lokalny={local_size}, zdalny={remote_size}")
+                    else:
+                        device.system_services_ok = "Istnieje"
+                except FileNotFoundError:
+                    device.system_services_ok = "Brak"
+                except Exception as e:
+                    device.system_services_ok = "Błąd"
+                    self.log(f"  ⚠️ Błąd sprawdzania System Services: {str(e)}")
+                
+                self.log(f"  ⚙️ Status System Services: {device.system_services_ok}")
+                self.log(f"  📦 Aktualna wersja FW: {device.firmware_version}")
+                self.log(f"  🕐 Aktualna strefa czasowa: {device.timezone}")
+                
+                # 4. System Services - TYLKO UPLOAD, REBOOT PÓŹNIEJ
+                if device.system_services_ok != "OK":
+                    self.log(f"  ⚙️ System Services: {device.system_services_ok}. Wymagana aktualizacja.")
+                    
+                    local_sys_file = resource_path(SYSTEM_SERVICES_FILE)
+                    if not os.path.exists(local_sys_file):
+                        raise Exception(f"Plik {SYSTEM_SERVICES_FILE} nie istnieje lokalnie!")
+                    
+                    remote_sys_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
+                    filename = os.path.basename(local_sys_file)
+                    
+                    self.log(f"  📤 Wysyłanie {filename}...")
+                    
+                    sftp.put(
+                        local_sys_file, 
+                        remote_sys_path,
+                        callback=lambda transferred, total: self.upload_callback(
+                            filename, transferred, total
+                        )
+                    )
+                    
+                    # Weryfikacja
+                    remote_size = sftp.stat(remote_sys_path).st_size
+                    local_size = os.path.getsize(local_sys_file)
+                    if remote_size != local_size:
+                        raise Exception(f"Transfer SS niepełny! Lokalny: {local_size}, Zdalny: {remote_size}")
+                    
+                    self.reset_upload_progress()
+                    device.system_services_ok = "OK"
+                    ss_updated = True
+                    self.log(f"  ✓ System Services wysłane i zweryfikowane")
                 else:
-                    device.system_services_ok = "Istnieje"
-            except:
-                device.system_services_ok = "Brak"
-            
-            self.log(f"  ⚙️  Status System Services: {device.system_services_ok}")
-            self.log(f"  📦 Aktualna wersja FW: {device.firmware_version}")
-            self.log(f"  🕐 Aktualna strefa czasowa: {device.timezone}")
-            
-            # 5. System Services
-            if device.system_services_ok != "OK":
-                self.log(f"  ⚙️  System Services: {device.system_services_ok}. Wymagana aktualizacja.")
+                    self.log("  ⚙️ System Services OK - pomijam wysyłkę")
                 
-                local_sys_file = resource_path(SYSTEM_SERVICES_FILE)
-                if not os.path.exists(local_sys_file):
-                    raise Exception(f"Plik {SYSTEM_SERVICES_FILE} nie istnieje lokalnie!")
-                
-                remote_sys_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
-                self.log(f"  📤 Wysyłanie {SYSTEM_SERVICES_FILE}...")
-                sftp.put(local_sys_file, remote_sys_path)
-                device.system_services_ok = "OK"
-                ss_updated = True 
-                self.log(f"  ✓ System Services wysłane.")
-            else:
-                self.log("  ⚙️  System Services OK - pomijam wysyłkę.")
-            
-            # 6. Firmware
-            if not self.compare_firmware_versions(device.firmware_version, firmware_file):
-                fw_needed = True
-                target_fw_version = self.get_target_fw_version(firmware_file)
-                self.log(f"  📦 Firmware nieaktualne. Wymagana aktualizacja do: {target_fw_version}.")
-                
-                self.log("  📤 Wysyłanie Firmware...")
-                filename = os.path.basename(firmware_file)
-                remote_fw_path = f"/opt/plcnext/{filename}"
-                sftp.put(firmware_file, remote_fw_path)
-                self.log("  ✓ Plik firmware wysłany.")
-            else:
-                self.log(f"  📦 Firmware (v.{device.firmware_version}) jest aktualne - pomijam wysyłkę.")
+                # 5. Firmware - TYLKO UPLOAD, UPDATE PÓŹNIEJ
+                if not self.compare_firmware_versions(device.firmware_version, firmware_file):
+                    fw_needed = True
+                    target_fw_version = self.get_target_fw_version(firmware_file)
+                    self.log(f"  📦 Firmware nieaktualne. Aktualna: {device.firmware_version}, Docelowa: {target_fw_version}")
+                    
+                    self.log("  📤 Wysyłanie Firmware...")
+                    filename = os.path.basename(firmware_file)
+                    remote_fw_path = f"/opt/plcnext/{filename}"
+                    
+                    file_size = os.path.getsize(firmware_file)
+                    
+                    sftp.put(
+                        firmware_file, 
+                        remote_fw_path,
+                        callback=lambda transferred, total: self.upload_callback(
+                            filename, transferred, total
+                        )
+                    )
+                    
+                    # Weryfikacja
+                    remote_size = sftp.stat(remote_fw_path).st_size
+                    if remote_size != file_size:
+                        raise Exception(f"Transfer FW niepełny! Lokalny: {file_size}, Zdalny: {remote_size}")
+                    
+                    self.reset_upload_progress()
+                    self.log(f"  ✓ Plik firmware wysłany i zweryfikowany ({file_size/1024/1024:.1f} MB)")
+                else:
+                    self.log(f"  ✅ Firmware (v.{device.firmware_version}) jest aktualne - pomijam wysyłkę")
 
-            # 7. Timezone
-            if device.timezone.strip() != TIMEZONE.strip():
-                self.log(f"  🕐 Strefa czasowa niepoprawna. Ustawianie na {TIMEZONE}...")
+                # 6. Timezone - TYLKO USTAWIENIE, REBOOT PÓŹNIEJ
+                if device.timezone.strip() != TIMEZONE.strip():
+                    self.log(f"  🕐 Strefa czasowa niepoprawna. Ustawianie na {TIMEZONE}...")
+                    
+                    stdin, stdout, stderr = ssh.exec_command(
+                        f"sudo sh -c 'echo {TIMEZONE} > /etc/timezone'", 
+                        get_pty=True
+                    )
+                    stdin.write(device.password + "\n")
+                    stdin.flush()
+                    time.sleep(1)
+                    
+                    stdin, stdout, stderr = ssh.exec_command(
+                        f"sudo timedatectl set-timezone {TIMEZONE}", 
+                        get_pty=True
+                    )
+                    stdin.write(device.password + "\n")
+                    stdin.flush()
+                    time.sleep(1)
+                    
+                    device.timezone = TIMEZONE
+                    tz_updated = True
+                    self.log("  ✓ Strefa czasowa ustawiona")
+                else:
+                    self.log("  🕐 Strefa czasowa OK - pomijam zmianę")
                 
-                # UŻYJ INVOKE_SHELL + SU (jak w pojedynczym sterowniku)
-                shell = ssh.invoke_shell()
-                
-                def send_cmd(cmd, wait=1):
-                    shell.send(cmd + "\n")
-                    time.sleep(wait)
-                
-                # Ustaw hasło root
-                send_cmd("sudo passwd root")
-                send_cmd(device.password)
-                send_cmd(ROOT_PASS)
-                send_cmd(ROOT_PASS)
-                
-                # Przełącz na root
-                send_cmd("su")
-                send_cmd(ROOT_PASS)
-                
-                # Ustaw strefę czasową
-                send_cmd(f"ln -sf /usr/share/zoneinfo/{TIMEZONE} /etc/localtime")
-                send_cmd(f"echo '{TIMEZONE}' > /etc/timezone")
-                
-                # Wyłącz hasło root
-                send_cmd("passwd -dl root")
-                send_cmd("exit")
-                
-                time.sleep(2)
-                
-                device.timezone = TIMEZONE
-                self.log("  ✓ Strefa czasowa ustawiona.")
-            else:
-                self.log("  🕐 Strefa czasowa OK - pomijam zmianę.")
+                # ✅ KLUCZOWE: Zamknij SFTP PRZED jakimkolwiek rebootem/update
+                self.log("  🔒 Zamykam SFTP przed rebootem/update...")
+                sftp.close()
             
-            # ZAMKNIJ SFTP PRZED UPDATE/REBOOT
-            sftp.close()
-            sftp = None
+            # ✅ Context manager zamknął SSH tutaj - wszystkie transfery zakończone!
             
-            # 8. Update/Restart - POPRAWIONA WERSJA Z CHANNEL
-            if fw_needed or ss_updated:
+            # 7. TERAZ WYKONAJ UPDATE/REBOOT (nowe połączenie SSH)
+            needs_reboot = ss_updated or tz_updated
+            
+            if fw_needed or needs_reboot:
                 self.log("  🔄 WYKONYWANIE AKTUALIZACJI / RESTART...")
                 
                 if fw_needed:
-                    update_command = f"sudo update-axcf{device.plc_model}"
-                    self.log(f"     ⚠️  Uruchamiam: {update_command}")
-                    self.log(f"     ⏳ Czekam na zakończenie procesu update (może zająć kilka minut)...")
+                    # Firmware update - to robi automatyczny reboot
+                    self.execute_firmware_update(device)
                     
-                    # Użyj channel zamiast exec_command
-                    channel = ssh.get_transport().open_session()
-                    channel.get_pty()
-                    channel.exec_command(update_command)
-                    
-                    # Wyślij hasło
-                    time.sleep(0.5)
-                    channel.send(device.password + "\n")
-                    
-                    # CZYTAJ OUTPUT
-                    output = ""
-                    start_time = time.time()
-                    timeout = 300  # 5 minut
-                    
-                    while True:
-                        if time.time() - start_time > timeout:
-                            self.log("     ⚠️  Timeout - przekroczono 5 minut oczekiwania")
-                            break
-                        
-                        if channel.recv_ready():
-                            chunk = channel.recv(1024).decode(errors="ignore")
-                            output += chunk
-                            for line in chunk.split('\n'):
-                                if line.strip() and any(keyword in line.lower() for keyword in 
-                                    ['installing', 'updating', 'done', 'success', 'error', 'failed', 'reboot']):
-                                    self.log(f"        {line.strip()}")
-                        
-                        if channel.exit_status_ready():
-                            exit_code = channel.recv_exit_status()
-                            self.log(f"     ✓ Proces zakończony z kodem: {exit_code}")
-                            break
-                        
-                        time.sleep(0.5)
-                    
-                    if channel.recv_stderr_ready():
-                        errors = channel.recv_stderr(4096).decode(errors="ignore")
-                        if errors.strip():
-                            self.log(f"     ⚠️  Stderr: {errors[:200]}")
-                    
-                    channel.close()
-                    self.log("  ✓ Aktualizacja firmware zakończona. Sterownik restartuje się.")
-                
-                elif ss_updated:
-                    self.log("     ⚠️  Tylko SysServices wgrane. Uruchamiam 'sudo reboot'.")
-                    
-                    stdin, stdout, stderr = ssh.exec_command("sudo reboot", get_pty=True)
-                    stdin.write(device.password + "\n")
-                    stdin.flush()
-                    time.sleep(2)
-                    
-                    self.log("  ✓ Sterownik restartuje się.")
-                
-                try:
-                    ssh.close()
-                except:
-                    pass
-                ssh = None
-                
+                elif needs_reboot:
+                    # Tylko reboot (SS lub TZ się zmieniły, ale nie FW)
+                    self.execute_reboot(device)
             else:
-                self.log("  ℹ️  Wszystkie komponenty aktualne. Pomijam restart.")
-                ssh.close()
-                ssh = None
+                self.log("  ℹ️ Wszystkie komponenty aktualne. Pomijam restart")
 
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return True
             
         except Exception as e:
-            if sftp:
-                try:
-                    sftp.close()
-                except:
-                    pass
-            if ssh:
-                try:
-                    ssh.close()
-                except:
-                    pass
+            self.reset_upload_progress()
             raise e
+
 
     def set_timezone_ssh(self, ssh, password):
         """
