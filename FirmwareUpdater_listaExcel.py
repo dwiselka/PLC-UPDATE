@@ -58,11 +58,14 @@ class BatchProcessorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PLC Batch Updater - Phoenix Contact")
-        self.geometry("1200x900")
+        self.geometry("1350x800")
         try:
             self.iconbitmap(resource_path("plcv2.ico"))
         except:
             pass
+
+        style = ttk.Style()
+        style.configure('TNotebook.Tab', font=('Arial', 10, 'bold'))
 
         # Zmienne stanu
         self.excel_path = tk.StringVar()
@@ -945,8 +948,15 @@ class BatchProcessorApp(tk.Tk):
                     
                     self.devices.append(device)
                     self.device_tree.insert("", "end", text=name, values=(
-                        ip, device.firmware_version, device.timezone, 
-                        device.system_services_ok, device.last_check, device.status
+                        ip,                          # IP (kolumna 0)
+                        "",                          # Model (kolumna 1) - puste, bo nie odczytano jeszcze
+                        device.firmware_version,     # Firmware (kolumna 2)
+                        "",                          # PLCTime (kolumna 3) - puste
+                        device.timezone,             # Timezone (kolumna 4)
+                        device.system_services_ok,   # SysServices (kolumna 5)
+                        device.last_check,           # LastCheck (kolumna 6)
+                        device.status,               # Status (kolumna 7)
+                        ""                           # Issues (kolumna 8) - puste
                     ))
             
             wb.close()
@@ -1589,48 +1599,53 @@ class BatchProcessorApp(tk.Tk):
             plc_time_display = device.plc_time
             if device.time_sync_error:
                 plc_time_display = f"❌ {device.plc_time}"
-                issues.append("⏰ Desynchronizacja czasu")
+                issues.append("Desynchronizacja czasu")
                 has_issues = True
             
             # 2. Problem z System Services
             sys_services_display = device.system_services_ok
             if device.system_services_ok not in ["OK", ""]:
                 sys_services_display = f"❌ {device.system_services_ok}"
-                issues.append("⚙️ System Services")
+                issues.append("System Services")
                 has_issues = True
             
             # 3. Problem ze strefą czasową
             timezone_display = device.timezone
             if device.timezone and device.timezone.strip() != TIMEZONE.strip():
                 timezone_display = f"❌ {device.timezone}"
-                issues.append(f"🕐 Strefa czasowa ({device.timezone} ≠ {TIMEZONE})")
+                issues.append(f"Strefa czasowa ({device.timezone} ≠ {TIMEZONE})")
                 has_issues = True
             
-            # 4. Tekst w kolumnie "Issues"
-            issues_text = "\n".join(issues) if issues else "✅ Brak"
+            # ✅ 4. Tekst w kolumnie "Issues" - DODAJ LOGIKĘ DLA "W trakcie..."
+            if device.status == "W trakcie...":
+                issues_text = "Sprawdzanie..."  # ⬅️ NOWE: Podczas odczytu
+            elif issues:
+                issues_text = "\n".join(issues)
+            else:
+                issues_text = "✅ Brak"
             
-            # ✅ AKTUALIZUJ WARTOŚCI z ❌ w problemowych komórkach
+            # AKTUALIZUJ WARTOŚCI z ❌ w problemowych komórkach
             self.device_tree.item(item_id, values=(
                 device.ip,
-                f"AXC F {device.plc_model}" if device.plc_model else "?",
+                f"AXC F {device.plc_model}" if device.plc_model else "",
                 device.firmware_version,
-                plc_time_display,         # ✅ Z ❌ jeśli problem
-                timezone_display,         # ✅ Z ❌ jeśli problem
-                sys_services_display,     # ✅ Z ❌ jeśli problem
+                plc_time_display,
+                timezone_display,
+                sys_services_display,
                 device.last_check, 
                 device.status,
-                issues_text
+                issues_text  # ⬅️ Teraz pokazuje " Sprawdzanie..." podczas odczytu
             ))
             
-            # ✅ KOLORUJ CAŁY WIERSZ jeśli są problemy
+            # KOLORUJ CAŁY WIERSZ jeśli są problemy
             if has_issues:
-                self.device_tree.item(item_id, tags=('has_issues',))  # Czerwony cały wiersz
+                self.device_tree.item(item_id, tags=('has_issues',))
             elif device.status == "✓ OK":
-                self.device_tree.item(item_id, tags=('success',))     # Zielony dla sukcesu
+                self.device_tree.item(item_id, tags=('success',))
             elif device.status == "✗ Błąd":
-                self.device_tree.item(item_id, tags=('error',))       # Czerwony dla błędu
+                self.device_tree.item(item_id, tags=('error',))
             else:
-                self.device_tree.item(item_id, tags=())               # Domyślny
+                self.device_tree.item(item_id, tags=())
             
             self.device_tree.update_idletasks()
 
