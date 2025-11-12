@@ -96,18 +96,17 @@ class BatchProcessorApp(tk.Tk):
             
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            
-            # Zwiększone timeouty dla stabilności
             ssh.connect(
                 device.ip, 
                 username=PLC_USER, 
                 password=device.password, 
                 timeout=30,
                 banner_timeout=30,
-                auth_timeout=30
+                auth_timeout=30,
+                allow_agent=False,
+                look_for_keys=False
             )
             
-            # Otwórz SFTP tylko gdy potrzebne
             sftp = ssh.open_sftp()
             
             self.log(f"  ✓ Połączono z {device.ip}")
@@ -119,31 +118,37 @@ class BatchProcessorApp(tk.Tk):
             raise
             
         finally:
-            # ZAWSZE zamknij połączenia
+            # Zamknij SFTP
             if sftp:
                 try:
                     sftp.close()
                     self.log(f"  🔒 Zamknięto SFTP")
+                    time.sleep(0.7)
                 except Exception as e:
                     self.log(f"  ⚠️  Błąd zamykania SFTP: {str(e)}")
             
+            # Zamknij SSH
             if ssh:
                 try:
+                    transport = ssh.get_transport()
+                    if transport and transport.is_active():
+                        transport.close()
                     ssh.close()
                     self.log(f"  🔒 Zamknięto SSH")
+                    time.sleep(1) 
                 except Exception as e:
                     self.log(f"  ⚠️  Błąd zamykania SSH: {str(e)}")
             
-            # Dodatkowe czekanie na pełne zamknięcie
-            time.sleep(0.5)
+
+            time.sleep(2)
 
 
     def execute_firmware_update(self, device):
         """
         Wykonuje sudo update firmware (tworzy NOWE połączenie SSH).
-        Bezpiecznie zamyka połączenie przed rebootem.
         """
         ssh = None
+        channel = None
         try:
             self.log(f"  🔗 Nowe połączenie SSH dla firmware update...")
             
@@ -203,18 +208,23 @@ class BatchProcessorApp(tk.Tk):
             time.sleep(30)
             
         except Exception as e:
+            raise e
+        finally:
+            if channel:
+                try:
+                    channel.close()
+                    self.log("  🔒 Zamknięto kanał SSH")
+                except:
+                    pass
             if ssh:
                 try:
                     ssh.close()
+                    self.log("  🔒 Zamknięto SSH")
                 except:
                     pass
-            raise e
+            time.sleep(10)
 
     def execute_reboot(self, device):
-        """
-        Wykonuje sudo reboot (tworzy NOWE połączenie SSH).
-        Bezpiecznie zamyka połączenie przed rebootem.
-        """
         ssh = None
         try:
             self.log(f"  🔗 Nowe połączenie SSH dla reboot...")
@@ -225,7 +235,9 @@ class BatchProcessorApp(tk.Tk):
                 device.ip, 
                 username=PLC_USER, 
                 password=device.password, 
-                timeout=30
+                timeout=30,
+                banner_timeout=30,
+                auth_timeout=30
             )
             
             self.log("  ⚠️ Uruchamiam 'sudo reboot'...")
@@ -235,23 +247,24 @@ class BatchProcessorApp(tk.Tk):
             stdin.flush()
             time.sleep(2)
             
-            ssh.close()
-            
-            self.log("  ✓ Sterownik restartuje się")
-            self.log("  ⏳ Czekam 30s na restart sterownika...")
-            time.sleep(30)
-            
         except Exception as e:
-            if ssh:
-                try:
-                    ssh.close()
-                except:
-                    pass
             # Ignoruj błędy zamknięcia - reboot ich powoduje
-            if "Socket is closed" in str(e) or "Timeout" in str(e):
+            if "Socket is closed" in str(e) or "Timeout" in str(e) or "EOF" in str(e):
                 self.log("  ✓ Reboot zainicjowany (połączenie przerwane - oczekiwane)")
             else:
                 raise e
+        finally:
+            if ssh:
+                try:
+                    ssh.close()
+                    self.log("  🔒 Zamknięto SSH po reboot")
+                except:
+                    pass
+            time.sleep(1)
+            
+        # Czekaj na restart
+        self.log("  ⏳ Czekam 30s na restart sterownika...")
+        time.sleep(60)
 
 
 
@@ -315,6 +328,11 @@ class BatchProcessorApp(tk.Tk):
             if not self.processing:
                 self.log("⏹️  Operacja zatrzymana przez użytkownika")
                 break
+            
+            # OPÓŹNIENIE MIĘDZY STEROWNIKAMI (oprócz pierwszego)
+            if idx > 1:
+                self.log(f"\n⏳ Czekam 5 sekund przed kolejnym sterownikiem...")
+                time.sleep(5)
             
             self.log(f"\n{'='*60}")
             self.log(f"[{idx}/{total}] 🔧 Przetwarzanie: {device.name} ({device.ip})")
