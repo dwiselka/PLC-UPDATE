@@ -12,7 +12,7 @@ from openpyxl.styles import PatternFill, Font
 import queue
 from contextlib import contextmanager
 
-# cd "C:\Users\dawid.wiselka\OneDrive - NOMAD ELECTRIC Sp. z o.o\Dokumenty\Farmy\Updater\all"
+# cd "C:\Users\dawid.wiselka\OneDrive - NOMAD ELECTRIC Sp. z o.o\Dokumenty\Farmy\Updater\all\PLC-UPDATE"
 # python FirmwareUpdater_listaExcel.py
 # pyinstaller --onefile --noconsole --icon="plcv2.ico" --add-data "plcv2.ico;." --add-data "Default.scm.config;." FirmwareUpdater_listaExcel.py
 
@@ -193,8 +193,7 @@ class BatchProcessorApp(tk.Tk):
                     self.log(f"  ✓ Proces zakończony z kodem: {exit_code}")
                     
                     if exit_code != 0:
-                        raise Exception(f"Update zakończony z błędem (exit code: {exit_code})")
-                    
+                            self.log(f"  ⚠️ Exit code: {exit_code} (może być normalne przy reboot)")
                     break
                 
                 time.sleep(0.5)
@@ -794,6 +793,7 @@ class BatchProcessorApp(tk.Tk):
         self.device_tree.heading("SysServices", text="System Services")
         self.device_tree.heading("LastCheck", text="Ostatni odczyt")
         self.device_tree.heading("Status", text="Status")
+        self.device_tree.heading("Issues", text="Issues") 
 
         self.device_tree.column("#0", width=150)
         self.device_tree.column("IP", width=120)
@@ -804,9 +804,13 @@ class BatchProcessorApp(tk.Tk):
         self.device_tree.column("SysServices", width=100)
         self.device_tree.column("LastCheck", width=150)
         self.device_tree.column("Status", width=120)
+        self.device_tree.column("Issues", width=150)
 
         # Konfiguracja tagów dla kolorowania
-        self.device_tree.tag_configure('time_error', foreground='red')
+        #self.device_tree.tag_configure('time_error', foreground='red')
+        self.device_tree.tag_configure('success', foreground='cobaltgreen')
+        self.device_tree.tag_configure('error', foreground='orange') #sienna1
+        self.device_tree.tag_configure('has_issues', foreground='orangered1')
 
         self.device_tree.pack(side="left", fill="both", expand=True)
         table_scroll_y.pack(side="right", fill="y")
@@ -1568,7 +1572,7 @@ class BatchProcessorApp(tk.Tk):
         time.sleep(2)
 
     def update_device_row(self, device):
-        """Aktualizuje pojedynczy wiersz w Treeview z kolorowaniem czasu."""
+        """Aktualizuje pojedynczy wiersz w Treeview z oznaczeniem problemów."""
         
         item_id = None
         for item in self.device_tree.get_children():
@@ -1577,23 +1581,56 @@ class BatchProcessorApp(tk.Tk):
                 break
         
         if item_id:
-            # Aktualizuj wartości
+            # ZBIERZ PROBLEMY i dodaj ❌ do wartości
+            issues = []
+            has_issues = False
+            
+            # 1. Problem z czasem PLC
+            plc_time_display = device.plc_time
+            if device.time_sync_error:
+                plc_time_display = f"❌ {device.plc_time}"
+                issues.append("⏰ Desynchronizacja czasu")
+                has_issues = True
+            
+            # 2. Problem z System Services
+            sys_services_display = device.system_services_ok
+            if device.system_services_ok not in ["OK", ""]:
+                sys_services_display = f"❌ {device.system_services_ok}"
+                issues.append("⚙️ System Services")
+                has_issues = True
+            
+            # 3. Problem ze strefą czasową
+            timezone_display = device.timezone
+            if device.timezone and device.timezone.strip() != TIMEZONE.strip():
+                timezone_display = f"❌ {device.timezone}"
+                issues.append(f"🕐 Strefa czasowa ({device.timezone} ≠ {TIMEZONE})")
+                has_issues = True
+            
+            # 4. Tekst w kolumnie "Issues"
+            issues_text = "\n".join(issues) if issues else "✅ Brak"
+            
+            # ✅ AKTUALIZUJ WARTOŚCI z ❌ w problemowych komórkach
             self.device_tree.item(item_id, values=(
                 device.ip,
                 f"AXC F {device.plc_model}" if device.plc_model else "?",
                 device.firmware_version,
-                device.plc_time, 
-                device.timezone, 
-                device.system_services_ok, 
+                plc_time_display,         # ✅ Z ❌ jeśli problem
+                timezone_display,         # ✅ Z ❌ jeśli problem
+                sys_services_display,     # ✅ Z ❌ jeśli problem
                 device.last_check, 
-                device.status
+                device.status,
+                issues_text
             ))
             
-            # NOWE: Ustaw tag dla kolorowania jeśli jest błąd synchronizacji czasu
-            if device.time_sync_error:
-                self.device_tree.item(item_id, tags=('time_error',))
+            # ✅ KOLORUJ CAŁY WIERSZ jeśli są problemy
+            if has_issues:
+                self.device_tree.item(item_id, tags=('has_issues',))  # Czerwony cały wiersz
+            elif device.status == "✓ OK":
+                self.device_tree.item(item_id, tags=('success',))     # Zielony dla sukcesu
+            elif device.status == "✗ Błąd":
+                self.device_tree.item(item_id, tags=('error',))       # Czerwony dla błędu
             else:
-                self.device_tree.item(item_id, tags=())
+                self.device_tree.item(item_id, tags=())               # Domyślny
             
             self.device_tree.update_idletasks()
 
