@@ -122,6 +122,7 @@ class BatchProcessorApp(tk.Tk):
             if sftp:
                 try:
                     sftp.close()
+                    time.sleep(1)
                     self.log(f"  🔒 Zamknięto SFTP")
                     time.sleep(0.3)
                 except Exception as e:
@@ -134,6 +135,7 @@ class BatchProcessorApp(tk.Tk):
                     if transport and transport.is_active():
                         transport.close()
                     ssh.close()
+                    time.sleep(1)
                     self.log(f"  🔒 Zamknięto SSH")
                     time.sleep(1) 
                 except Exception as e:
@@ -142,9 +144,6 @@ class BatchProcessorApp(tk.Tk):
 
 
     def execute_firmware_update(self, device):
-        """
-        Wykonuje sudo update firmware (tworzy NOWE połączenie SSH).
-        """
         ssh = None
         channel = None
         try:
@@ -156,7 +155,7 @@ class BatchProcessorApp(tk.Tk):
                 device.ip, 
                 username=PLC_USER, 
                 password=device.password, 
-                timeout=30
+                timeout=30,
                 banner_timeout=30,
                 auth_timeout=30,
                 allow_agent=False,
@@ -170,7 +169,6 @@ class BatchProcessorApp(tk.Tk):
             channel = ssh.get_transport().open_session()
             channel.get_pty()
             channel.exec_command(update_command)
-            
             channel.send(device.password + "\n")
             
             output = ""
@@ -193,6 +191,10 @@ class BatchProcessorApp(tk.Tk):
                 if channel.exit_status_ready():
                     exit_code = channel.recv_exit_status()
                     self.log(f"  ✓ Proces zakończony z kodem: {exit_code}")
+                    
+                    if exit_code != 0:
+                        raise Exception(f"Update zakończony z błędem (exit code: {exit_code})")
+                    
                     break
                 
                 time.sleep(0.5)
@@ -201,9 +203,6 @@ class BatchProcessorApp(tk.Tk):
                 errors = channel.recv_stderr(4096).decode(errors="ignore")
                 if errors.strip():
                     self.log(f"  ⚠️ Stderr: {errors[:200]}")
-            
-            channel.close()
-            ssh.close()
             
             self.log("  ✓ Aktualizacja firmware zakończona. Sterownik restartuje się")
             self.log("  ⏳ Czekam 30s na restart sterownika...")
@@ -218,13 +217,19 @@ class BatchProcessorApp(tk.Tk):
                     self.log("  🔒 Zamknięto kanał SSH")
                 except:
                     pass
+            
             if ssh:
                 try:
+                    transport = ssh.get_transport()
+                    if transport and transport.is_active():
+                        transport.close()
                     ssh.close()
+                    time.sleep(1)
                     self.log("  🔒 Zamknięto SSH")
                 except:
                     pass
-            time.sleep(10)
+            
+            time.sleep(3)
 
     def execute_reboot(self, device):
         ssh = None
@@ -259,13 +264,14 @@ class BatchProcessorApp(tk.Tk):
             if ssh:
                 try:
                     ssh.close()
+                    time.sleep(1)
                     self.log("  🔒 Zamknięto SSH po reboot")
                 except:
                     pass
             time.sleep(1)
             
         # Czekaj na restart
-        self.log("  ⏳ Czekam 30s na restart sterownika...")
+        self.log("  ⏳ Czekam 60s na restart sterownika...")
         time.sleep(60)
 
 
@@ -1499,11 +1505,12 @@ class BatchProcessorApp(tk.Tk):
                 else:
                     self.log("  🕐 Strefa czasowa OK - pomijam zmianę")
                 
-                # ✅ KLUCZOWE: Zamknij SFTP PRZED jakimkolwiek rebootem/update
+                # Zamknij SFTP PRZED jakimkolwiek rebootem/update
                 self.log("  🔒 Zamykam SFTP przed rebootem/update...")
                 sftp.close()
+                time.sleep(1)
             
-            # ✅ Context manager zamknął SSH tutaj - wszystkie transfery zakończone!
+            # Context manager zamknął SSH tutaj - wszystkie transfery zakończone!
             
             # 7. TERAZ WYKONAJ UPDATE/REBOOT (nowe połączenie SSH)
             needs_reboot = ss_updated or tz_updated
@@ -1782,7 +1789,9 @@ class BatchProcessorApp(tk.Tk):
             # Weryfikacja
             remote_size = sftp.stat(remote_path).st_size
             sftp.close()
+            time.sleep(1)
             ssh.close()
+            time.sleep(1)
             
             if remote_size == file_size:
                 self.status_bar.config(text="Gotowy")
@@ -1800,8 +1809,10 @@ class BatchProcessorApp(tk.Tk):
         except Exception as e:
             if sftp:
                 sftp.close()
+                time.sleep(1)
             if ssh:
                 ssh.close()
+                time.sleep(1)
             self.status_bar.config(text="Błąd")
             self.log(f"✗ Błąd wysyłania firmware: {str(e)}")
             self.after(0, lambda: messagebox.showerror("Błąd", f"Błąd:\n{str(e)}"))
@@ -1855,6 +1866,7 @@ class BatchProcessorApp(tk.Tk):
             errors = stderr.read().decode(errors="ignore")
             
             ssh.close()
+            time.sleep(1)
             
             if "error" in output.lower() or "failed" in output.lower() or errors.strip():
                 raise Exception(f"Update zwrócił błąd:\n{output}\n{errors}")
