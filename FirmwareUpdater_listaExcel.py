@@ -123,7 +123,7 @@ class BatchProcessorApp(tk.Tk):
                 try:
                     sftp.close()
                     self.log(f"  🔒 Zamknięto SFTP")
-                    time.sleep(0.7)
+                    time.sleep(0.3)
                 except Exception as e:
                     self.log(f"  ⚠️  Błąd zamykania SFTP: {str(e)}")
             
@@ -138,9 +138,7 @@ class BatchProcessorApp(tk.Tk):
                     time.sleep(1) 
                 except Exception as e:
                     self.log(f"  ⚠️  Błąd zamykania SSH: {str(e)}")
-            
-
-            time.sleep(2)
+        
 
 
     def execute_firmware_update(self, device):
@@ -159,6 +157,10 @@ class BatchProcessorApp(tk.Tk):
                 username=PLC_USER, 
                 password=device.password, 
                 timeout=30
+                banner_timeout=30,
+                auth_timeout=30,
+                allow_agent=False,
+                look_for_keys=False
             )
             
             update_command = f"sudo update-axcf{device.plc_model}"
