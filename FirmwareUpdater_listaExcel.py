@@ -776,7 +776,7 @@ class BatchProcessorApp(tk.Tk):
         table_scroll_x = tk.Scrollbar(table_frame, orient="horizontal")
 
         self.device_tree = ttk.Treeview(table_frame, 
-                                columns=("IP", "Model", "Firmware", "PLCTime", "Timezone", "SysServices", "LastCheck", "Status"),
+                                columns=("IP", "Model", "Firmware", "PLCTime", "Timezone", "SysServices", "LastCheck", "Status", "Issues"),
                                 show="tree headings",
                                 yscrollcommand=table_scroll_y.set,
                                 xscrollcommand=table_scroll_x.set)
@@ -808,9 +808,9 @@ class BatchProcessorApp(tk.Tk):
 
         # Konfiguracja tagów dla kolorowania
         #self.device_tree.tag_configure('time_error', foreground='red')
-        self.device_tree.tag_configure('success', foreground='cobaltgreen')
-        self.device_tree.tag_configure('error', foreground='orange') #sienna1
-        self.device_tree.tag_configure('has_issues', foreground='orangered1')
+        #self.device_tree.tag_configure('success', foreground='#3D9140')
+        self.device_tree.tag_configure('error', background='#FFA500') #sienna1
+        self.device_tree.tag_configure('has_issues', background='#FF4500')
 
         self.device_tree.pack(side="left", fill="both", expand=True)
         table_scroll_y.pack(side="right", fill="y")
