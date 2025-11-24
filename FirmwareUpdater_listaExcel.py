@@ -25,7 +25,7 @@ ROOT_PASS = "12345"
 TIMEZONE = "Europe/Warsaw"
 SYSTEM_SERVICES_FILE = "Default.scm.config"
 RETRY_ATTEMPTS = 3
-RETRY_DELAY = 10  # sekund
+RETRY_DELAY = 10
 
 def resource_path(relative_path):
     """Zwraca absolutną ścieżkę do pliku, działa również w exe PyInstaller."""
@@ -58,7 +58,7 @@ class BatchProcessorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PLC Batch Updater - Phoenix Contact")
-        self.geometry("1350x800")
+        self.geometry("1200x800")
         try:
             self.iconbitmap(resource_path("plcv2.ico"))
         except:
@@ -733,7 +733,7 @@ class BatchProcessorApp(tk.Tk):
 
         tk.Button(btn_grid, text="WYKONAJ WSZYSTKO NARAZ", 
             command=self.batch_update_all, 
-            bg="#FFCCD3", fg="black", font=("Arial", 10, "bold")).grid(row=1, column=1, padx=3, pady=2, sticky="ew") # Zmieniono font na 10
+            bg="#FFCCD3", fg="black", font=("Arial", 10, "bold")).grid(row=1, column=1, padx=3, pady=2, sticky="ew")
         
         btn_grid.columnconfigure(0, weight=1)
         btn_grid.columnconfigure(1, weight=1)
@@ -799,14 +799,14 @@ class BatchProcessorApp(tk.Tk):
         self.device_tree.heading("Issues", text="Issues") 
 
         self.device_tree.column("#0", width=150)
-        self.device_tree.column("IP", width=120)
+        self.device_tree.column("IP", width=90)
         self.device_tree.column("Model", width=80)
-        self.device_tree.column("Firmware", width=150)
+        self.device_tree.column("Firmware", width=100)
         self.device_tree.column("PLCTime", width=150)
         self.device_tree.column("Timezone", width=120)
         self.device_tree.column("SysServices", width=100)
         self.device_tree.column("LastCheck", width=150)
-        self.device_tree.column("Status", width=120)
+        self.device_tree.column("Status", width=80)
         self.device_tree.column("Issues", width=150)
 
         # Konfiguracja tagów dla kolorowania
