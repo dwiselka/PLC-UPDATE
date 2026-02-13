@@ -66,14 +66,65 @@ class BatchProcessorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PLC Batch Updater - Phoenix Contact")
-        self.geometry("1200x800")
+        self.geometry("1300x850")
+        self.configure(bg="#F0F4F8")
         try:
             self.iconbitmap(resource_path("plcv2.ico"))
         except:
             pass
 
         style = ttk.Style()
-        style.configure('TNotebook.Tab', font=('Arial', 10, 'bold'))
+        try:
+            style.theme_use('clam')
+        except:
+            pass
+
+        # Nowoczesny schemat kolorów
+        style.configure('TNotebook', 
+                       background="#F0F4F8", 
+                       borderwidth=0,
+                       tabmargins=[2, 5, 2, 0])
+        
+        style.configure('TNotebook.Tab', 
+                       font=('Segoe UI', 11, 'bold'),
+                       padding=(20, 10),
+                       borderwidth=0)
+        
+        style.map('TNotebook.Tab',
+                  background=[('selected', '#FFFFFF'), ('!selected', '#CBD5E1')],
+                  foreground=[('selected', '#1E40AF'), ('!selected', '#475569')],
+                  expand=[('selected', [1, 1, 1, 0])])
+
+        # Nowoczesna tabela
+        style.configure('Modern.Treeview',
+                        font=('Segoe UI', 10),
+                        rowheight=32,
+                        background='#FFFFFF',
+                        fieldbackground='#FFFFFF',
+                        borderwidth=0)
+        
+        style.configure('Modern.Treeview.Heading',
+                        font=('Segoe UI', 10, 'bold'),
+                        background='#E2E8F0',
+                        foreground='#1E293B',
+                        relief='flat',
+                        borderwidth=1)
+        
+        style.map('Modern.Treeview',
+                  background=[('selected', '#DBEAFE')],
+                  foreground=[('selected', '#1E293B')])
+        
+        style.map('Modern.Treeview.Heading',
+                  background=[('active', '#CBD5E1')])
+        
+        # Progress bar style
+        style.configure('Custom.Horizontal.TProgressbar',
+                       troughcolor='#E2E8F0',
+                       background='#3B82F6',
+                       bordercolor='#CBD5E1',
+                       lightcolor='#60A5FA',
+                       darkcolor='#2563EB',
+                       thickness=20)
 
         # Zmienne stanu
         self.excel_path = tk.StringVar()
@@ -93,6 +144,48 @@ class BatchProcessorApp(tk.Tk):
         
         # Timer do aktualizacji logów
         self.update_logs()
+
+    def create_action_button(self, parent, text, command, variant="neutral", **kwargs):
+        """Tworzy nowoczesny przycisk z lepszym designem."""
+        palette = {
+            "neutral": {"bg": "#E2E8F0", "fg": "#1E293B", "active": "#CBD5E1", "border": "#94A3B8"},
+            "primary": {"bg": "#3B82F6", "fg": "#FFFFFF", "active": "#2563EB", "border": "#1D4ED8"},
+            "success": {"bg": "#10B981", "fg": "#FFFFFF", "active": "#059669", "border": "#047857"},
+            "warning": {"bg": "#F59E0B", "fg": "#FFFFFF", "active": "#D97706", "border": "#B45309"},
+            "danger": {"bg": "#EF4444", "fg": "#FFFFFF", "active": "#DC2626", "border": "#B91C1C"},
+            "info": {"bg": "#06B6D4", "fg": "#FFFFFF", "active": "#0891B2", "border": "#0E7490"},
+            "accent": {"bg": "#8B5CF6", "fg": "#FFFFFF", "active": "#7C3AED", "border": "#6D28D9"}
+        }
+
+        color = palette.get(variant, palette["neutral"])
+        style = ttk.Style()
+        style_name = f"Modern.{variant}.TButton"
+        style.configure(
+            style_name,
+            font=("Segoe UI", 11, "bold"),
+            padding=(16, 10),
+            foreground=color["fg"],
+            background=color["bg"],
+            relief="flat",
+            borderwidth=1,
+            bordercolor=color["border"]
+        )
+        style.map(
+            style_name,
+            background=[('active', color["active"]), ('pressed', color["active"]), ('disabled', '#CBD5E1')],
+            foreground=[('disabled', '#94A3B8')],
+            relief=[('pressed', 'flat'), ('!pressed', 'flat')]
+        )
+
+        btn = ttk.Button(
+            parent,
+            text=text,
+            command=command,
+            style=style_name,
+            cursor="hand2",
+            **kwargs
+        )
+        return btn
 
 
     @contextmanager
@@ -393,7 +486,7 @@ class BatchProcessorApp(tk.Tk):
             # Aktualizuj GUI (thread-safe)
             self.after(0, lambda: self.upload_status_label.config(
                 text=status_text, 
-                fg="blue"
+                fg="#3B82F6"
             ))
             
             # Log co 10%
@@ -410,7 +503,7 @@ class BatchProcessorApp(tk.Tk):
         self.after(0, lambda: self.upload_progress.config(value=0))
         self.after(0, lambda: self.upload_status_label.config(
             text="Oczekiwanie na transfer...",
-            fg="gray"
+            fg="#64748B"
         ))
 
 
@@ -436,7 +529,7 @@ class BatchProcessorApp(tk.Tk):
         self.after(0, lambda: self.batch_progress.config(value=0))
         self.after(0, lambda: self.batch_progress_label.config(
             text=f"Start operacji {operation.upper()} (0/{total})",
-            fg="blue"
+            fg="#3B82F6"
         ))
         
         for idx, device in enumerate(self.devices, 1):
@@ -448,7 +541,7 @@ class BatchProcessorApp(tk.Tk):
             self.after(0, lambda p=progress_before: self.batch_progress.config(value=p))
             self.after(0, lambda i=idx, t=total, d=device: self.batch_progress_label.config(
                 text=f"Sterownik {i}/{t}: {d.name} ({d.ip})",
-                fg="blue"
+                fg="#3B82F6"
             ))
             
             # OPÓŹNIENIE MIĘDZY STEROWNIKAMI (oprócz pierwszego)
@@ -539,7 +632,7 @@ class BatchProcessorApp(tk.Tk):
             self.after(0, lambda p=progress_after: self.batch_progress.config(value=p))
             self.after(0, lambda i=idx, t=total: self.batch_progress_label.config(
                 text=f"Postęp: {i}/{t} sterowników",
-                fg="blue"
+                fg="#3B82F6"
             ))
 
         processed_count = success_count + failed_count
@@ -577,10 +670,10 @@ class BatchProcessorApp(tk.Tk):
         
         self.processing = False
         self.after(0, self.update_action_buttons_state)
-        self.after(0, lambda: self.status_bar.config(text="Gotowy"))
+        self.after(0, lambda: self.status_bar.config(text="✅ Gotowy"))
         self.after(0, lambda: self.batch_progress_label.config(
             text=f"Zakończono: sukces {success_count}, błędy {failed_count}, nieprzetworzone {not_processed_count}",
-            fg="green" if failed_count == 0 else "red"
+            fg="#10B981" if failed_count == 0 else "#EF4444"
         ))
         
         # Pokaż podsumowanie
@@ -833,43 +926,81 @@ class BatchProcessorApp(tk.Tk):
         return ""
 
     def create_widgets(self):
-        """Tworzy interfejs użytkownika."""
+        """Tworzy nowoczesny interfejs użytkownika."""
         
         # Notebook (zakładki)
         notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True, padx=5, pady=5)
+        notebook.pack(fill="both", expand=True, padx=8, pady=8)
         
         # ZAKŁADKA 1: Przetwarzanie wsadowe
-        batch_frame = tk.Frame(notebook)
-        notebook.add(batch_frame, text="Przetwarzanie wsadowe")
+        batch_frame = tk.Frame(notebook, bg="#F8FAFC")
+        notebook.add(batch_frame, text="📊 Przetwarzanie wsadowe")
         
         # Sekcja pliku Excel
-        excel_frame = tk.LabelFrame(batch_frame, text="Plik Excel z listą sterowników", padx=10, pady=10)
-        excel_frame.pack(fill="x", padx=10, pady=5)
+        excel_frame = tk.LabelFrame(batch_frame, 
+                                    text="  📁 Plik Excel z listą sterowników  ", 
+                                    padx=15, pady=12,
+                                    font=('Segoe UI', 11, 'bold'),
+                                    fg="#1E293B",
+                                    bg="#F8FAFC",
+                                    relief="solid",
+                                    borderwidth=1)
+        excel_frame.pack(fill="x", padx=12, pady=8)
         
-        tk.Button(excel_frame, 
-                  text="Wybierz plik Excel", 
-                  command=self.select_excel, 
-                  font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        self.create_action_button(
+            excel_frame,
+            text="📂 Wybierz plik Excel",
+            command=self.select_excel,
+            variant="neutral"
+        ).pack(side="left", padx=5)
 
-        tk.Label(excel_frame, textvariable=self.excel_path, bg="lightgray", relief="sunken", width=60).pack(side="left", padx=5)
+        tk.Label(excel_frame, 
+                textvariable=self.excel_path, 
+                bg="#FFFFFF", 
+                fg="#475569",
+                relief="groove", 
+                borderwidth=1,
+                font=('Segoe UI', 10),
+                width=55,
+                anchor="w",
+                padx=8, pady=6).pack(side="left", padx=8)
 
-        self.load_excel_btn = tk.Button(excel_frame,
-                        text="Wczytaj listę",
-                        command=self.load_excel,
-                        font=("Arial", 10, "bold"))
+        self.load_excel_btn = self.create_action_button(
+            excel_frame,
+            text="✅ Wczytaj listę",
+            command=self.load_excel,
+            variant="primary"
+        )
         self.load_excel_btn.pack(side="left", padx=5)
         
         # Sekcja firmware
-        firmware_frame = tk.LabelFrame(batch_frame, text="Plik Firmware (opcjonalnie dla aktualizacji)", padx=10, pady=10)
-        firmware_frame.pack(fill="x", padx=10, pady=5)
+        firmware_frame = tk.LabelFrame(batch_frame, 
+                                       text="  🔧 Plik Firmware (opcjonalnie dla aktualizacji)  ", 
+                                       padx=15, pady=12,
+                                       font=('Segoe UI', 11, 'bold'),
+                                       fg="#1E293B",
+                                       bg="#F8FAFC",
+                                       relief="solid",
+                                       borderwidth=1)
+        firmware_frame.pack(fill="x", padx=12, pady=8)
         
-        tk.Button(firmware_frame, 
-                  text="Wybierz firmware",
-                  command=self.select_firmware,
-                  font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        self.create_action_button(
+            firmware_frame,
+            text="📂 Wybierz firmware",
+            command=self.select_firmware,
+            variant="neutral"
+        ).pack(side="left", padx=5)
 
-        tk.Label(firmware_frame, textvariable=self.firmware_path, bg="lightgray", relief="sunken", width=60).pack(side="left", padx=5)
+        tk.Label(firmware_frame, 
+                textvariable=self.firmware_path, 
+                bg="#FFFFFF", 
+                fg="#475569",
+                relief="groove", 
+                borderwidth=1,
+                font=('Segoe UI', 10),
+                width=55,
+                anchor="w",
+                padx=8, pady=6).pack(side="left", padx=8)
         """
         # Typ sterownika
         plc_frame = tk.LabelFrame(batch_frame, text="Typ sterownika", padx=10, pady=5)
@@ -878,51 +1009,89 @@ class BatchProcessorApp(tk.Tk):
         tk.Radiobutton(plc_frame, text="AXC F 3152", variable=self.plc_type_var, value="3152").pack(side="left", padx=10)
         """
         # Przyciski akcji - ODCZYT
-        read_frame = tk.LabelFrame(batch_frame, text="Odczyt danych", padx=10, pady=5)
-        read_frame.pack(fill="x", padx=10, pady=5)
-        self.batch_read_btn = tk.Button(read_frame, text="Odczytaj wszystkie sterowniki", command=self.batch_read_all, 
-                        bg="#05DF72", fg="black", font=("Arial", 10, "bold"))
-        self.batch_read_btn.pack(fill="x", padx=5, pady=4)
+        read_frame = tk.LabelFrame(batch_frame, 
+                                  text="  📖 Odczyt danych  ", 
+                                  padx=15, pady=10,
+                                  font=('Segoe UI', 11, 'bold'),
+                                  fg="#1E293B",
+                                  bg="#F8FAFC",
+                                  relief="solid",
+                                  borderwidth=1)
+        read_frame.pack(fill="x", padx=12, pady=8)
+        self.batch_read_btn = self.create_action_button(
+            read_frame,
+            text="🔍 Odczytaj wszystkie sterowniki",
+            command=self.batch_read_all,
+            variant="success"
+        )
+        self.batch_read_btn.pack(fill="x", padx=5, pady=5)
 
         # Przyciski akcji - AKTUALIZACJE (osobne)
-        update_frame = tk.LabelFrame(batch_frame, text="Aktualizacje (wykonywane osobno)", padx=10, pady=5)
-        update_frame.pack(fill="x", padx=10, pady=5)
+        update_frame = tk.LabelFrame(batch_frame, 
+                                    text="  ⚙️ Aktualizacje (wykonywane osobno)  ", 
+                                    padx=15, pady=10,
+                                    font=('Segoe UI', 11, 'bold'),
+                                    fg="#1E293B",
+                                    bg="#F8FAFC",
+                                    relief="solid",
+                                    borderwidth=1)
+        update_frame.pack(fill="x", padx=12, pady=8)
         
-        btn_grid = tk.Frame(update_frame)
+        btn_grid = tk.Frame(update_frame, bg="#F8FAFC")
         btn_grid.pack(fill="x", padx=5, pady=5)
         
-        self.batch_sys_btn = tk.Button(btn_grid, text="Wyślij System Services (wszystkie)", 
-                           command=self.batch_system_services, 
-                           bg="#A2F4FD", fg="black", font=("Arial", 10, "bold"))
-        self.batch_sys_btn.grid(row=0, column=0, padx=3, pady=2, sticky="ew")
+        self.batch_sys_btn = self.create_action_button(
+            btn_grid,
+            text="📦 Wyślij System Services (wszystkie)",
+            command=self.batch_system_services,
+            variant="info"
+        )
+        self.batch_sys_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
 
-        self.batch_tz_btn = tk.Button(btn_grid, text="Ustaw strefę czasową (wszystkie)", 
-                                      command=self.batch_timezone, 
-                                      bg="#FFF085", fg="black", font=("Arial", 10, "bold"))
-        self.batch_tz_btn.grid(row=0, column=1, padx=3, pady=2, sticky="ew")
+        self.batch_tz_btn = self.create_action_button(
+            btn_grid,
+            text="🕐 Ustaw strefę czasową (wszystkie)",
+            command=self.batch_timezone,
+            variant="warning"
+        )
+        self.batch_tz_btn.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
-        self.batch_fw_btn = tk.Button(btn_grid, text="Aktualizuj Firmware (wszystkie)", 
-                                      command=self.batch_firmware_only, 
-                                      bg="#BEDBFF", fg="black", font=("Arial", 10, "bold"))
-        self.batch_fw_btn.grid(row=1, column=0, padx=3, pady=2, sticky="ew")
+        self.batch_fw_btn = self.create_action_button(
+            btn_grid,
+            text="🔄 Aktualizuj Firmware (wszystkie)",
+            command=self.batch_firmware_only,
+            variant="primary"
+        )
+        self.batch_fw_btn.grid(row=1, column=0, padx=5, pady=5, sticky="ew")
 
-        self.batch_all_btn = tk.Button(btn_grid, text="WYKONAJ WSZYSTKO NARAZ", 
-                                       command=self.batch_update_all, 
-                                       bg="#FFCCD3", fg="black", font=("Arial", 10, "bold"))
-        self.batch_all_btn.grid(row=1, column=1, padx=3, pady=2, sticky="ew")
+        self.batch_all_btn = self.create_action_button(
+            btn_grid,
+            text="⚡ WYKONAJ WSZYSTKO NARAZ",
+            command=self.batch_update_all,
+            variant="accent"
+        )
+        self.batch_all_btn.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
         
         btn_grid.columnconfigure(0, weight=1)
         btn_grid.columnconfigure(1, weight=1)
         
-        progress_frame = tk.LabelFrame(batch_frame, text="Status transferu plików", padx=10, pady=5)
-        progress_frame.pack(fill="x", padx=10, pady=5)
+        progress_frame = tk.LabelFrame(batch_frame, 
+                                       text="  📤 Status transferu plików  ", 
+                                       padx=15, pady=10,
+                                       font=('Segoe UI', 11, 'bold'),
+                                       fg="#1E293B",
+                                       bg="#F8FAFC",
+                                       relief="solid",
+                                       borderwidth=1)
+        progress_frame.pack(fill="x", padx=12, pady=8)
         
         # Progress bar
         self.upload_progress = ttk.Progressbar(
             progress_frame, 
             orient="horizontal", 
             length=100, 
-            mode="determinate"
+            mode="determinate",
+            style="Custom.Horizontal.TProgressbar"
         )
         self.upload_progress.pack(fill="x", padx=5, pady=5)
         
@@ -930,54 +1099,86 @@ class BatchProcessorApp(tk.Tk):
         self.upload_status_label = tk.Label(
             progress_frame, 
             text="Oczekiwanie na transfer...",
-            font=("Arial", 9),
-            fg="gray"
+            font=("Segoe UI", 10),
+            fg="#64748B",
+            bg="#F8FAFC"
         )
-        self.upload_status_label.pack(padx=5, pady=2)
+        self.upload_status_label.pack(padx=5, pady=4)
 
-        batch_progress_frame = tk.LabelFrame(batch_frame, text="Postęp operacji wsadowej", padx=10, pady=5)
-        batch_progress_frame.pack(fill="x", padx=10, pady=5)
+        batch_progress_frame = tk.LabelFrame(batch_frame, 
+                                            text="  📊 Postęp operacji wsadowej  ", 
+                                            padx=15, pady=10,
+                                            font=('Segoe UI', 11, 'bold'),
+                                            fg="#1E293B",
+                                            bg="#F8FAFC",
+                                            relief="solid",
+                                            borderwidth=1)
+        batch_progress_frame.pack(fill="x", padx=12, pady=8)
 
         self.batch_progress = ttk.Progressbar(
             batch_progress_frame,
             orient="horizontal",
             length=100,
-            mode="determinate"
+            mode="determinate",
+            style="Custom.Horizontal.TProgressbar"
         )
         self.batch_progress.pack(fill="x", padx=5, pady=5)
 
         self.batch_progress_label = tk.Label(
             batch_progress_frame,
             text="Oczekiwanie na start...",
-            font=("Arial", 9),
-            fg="gray"
+            font=("Segoe UI", 10),
+            fg="#64748B",
+            bg="#F8FAFC"
         )
-        self.batch_progress_label.pack(padx=5, pady=2)
+        self.batch_progress_label.pack(padx=5, pady=4)
     
 
-        control_frame = tk.Frame(batch_frame)
-        control_frame.pack(fill="x", padx=10, pady=5)
+        control_frame = tk.Frame(batch_frame, bg="#F8FAFC")
+        control_frame.pack(fill="x", padx=12, pady=8)
 
-        self.save_excel_btn = tk.Button(control_frame, text="Zapisz raport Excel", command=self.save_excel, 
-            bg="#2196F3", fg="black", font=("Arial", 10, "bold"))
+        self.save_excel_btn = self.create_action_button(
+            control_frame,
+            text="💾 Zapisz raport Excel",
+            command=self.save_excel,
+            variant="primary"
+        )
         self.save_excel_btn.pack(side="left", padx=5, fill="x", expand=True)
 
-        self.stop_btn = tk.Button(control_frame, text="STOP", command=self.stop_processing, 
-            bg="#F44336", fg="black", font=("Arial", 10, "bold"), state="disabled")
+        self.stop_btn = self.create_action_button(
+            control_frame,
+            text="⏹️ STOP",
+            command=self.stop_processing,
+            variant="danger",
+            state="disabled"
+        )
         self.stop_btn.pack(side="left", padx=5, fill="x", expand=True)
 
-        filter_frame = tk.Frame(batch_frame)
-        filter_frame.pack(fill="x", padx=10, pady=(0, 2))
+        filter_frame = tk.Frame(batch_frame, bg="#F8FAFC")
+        filter_frame.pack(fill="x", padx=12, pady=(0, 5))
         tk.Checkbutton(
             filter_frame,
-            text="Pokaż tylko sterowniki z problemami",
+            text="🔍 Pokaż tylko sterowniki z problemami",
             variable=self.show_errors_only,
-            command=self.refresh_device_tree
-        ).pack(side="left")
+            command=self.refresh_device_tree,
+            font=('Segoe UI', 10),
+            bg="#F8FAFC",
+            fg="#1E293B",
+            selectcolor="#FFFFFF",
+            activebackground="#F8FAFC",
+            relief="flat"
+        ).pack(side="left", padx=5)
         
         # Tabela ze sterownikami
-        table_frame = tk.LabelFrame(batch_frame, text="Lista sterowników", padx=5, pady=5)
-        table_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        table_frame = tk.LabelFrame(batch_frame, 
+                                   text="  📋 Lista sterowników  ", 
+                                   padx=10, pady=10,
+                                   font=('Segoe UI', 11, 'bold'),
+                                   fg="#1E293B",
+                                   bg="#F8FAFC",
+                                   relief="solid",
+                                   borderwidth=1)
+        table_frame.pack(fill="both", expand=True, padx=12, pady=8)
 
             # Scrollbar
         table_scroll_y = tk.Scrollbar(table_frame, orient="vertical")
@@ -986,6 +1187,7 @@ class BatchProcessorApp(tk.Tk):
         self.device_tree = ttk.Treeview(table_frame, 
                                 columns=("IP", "Model", "Firmware", "PLCTime", "Timezone", "SysServices", "LastCheck", "Status", "Issues"),
                                 show="tree headings",
+                                style='Modern.Treeview',
                                 yscrollcommand=table_scroll_y.set,
                                 xscrollcommand=table_scroll_x.set)
 
@@ -1015,10 +1217,9 @@ class BatchProcessorApp(tk.Tk):
         self.device_tree.column("Issues", width=150)
 
         # Konfiguracja tagów dla kolorowania
-        #self.device_tree.tag_configure('time_error', foreground='red')
-        self.device_tree.tag_configure('success', background='#D7FFD9')
-        self.device_tree.tag_configure('error', background='#FFA500') #sienna1
-        self.device_tree.tag_configure('has_issues', background='#FF4500')
+        self.device_tree.tag_configure('success', background='#D1FAE5', foreground='#065F46')
+        self.device_tree.tag_configure('error', background='#FEE2E2', foreground='#991B1B')
+        self.device_tree.tag_configure('has_issues', background='#FEF3C7', foreground='#92400E')
 
         self.device_tree.pack(side="left", fill="both", expand=True)
         table_scroll_y.pack(side="right", fill="y")
@@ -1026,21 +1227,40 @@ class BatchProcessorApp(tk.Tk):
 
 
         # ZAKŁADKA 2: Logi
-        log_frame = tk.Frame(notebook)
-        notebook.add(log_frame, text="Logi operacji")
+        log_frame = tk.Frame(notebook, bg="#F8FAFC")
+        notebook.add(log_frame, text="📄 Logi operacji")
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, font=("Courier", 9))
-        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
+        self.log_text = scrolledtext.ScrolledText(log_frame, 
+                                                   wrap=tk.WORD, 
+                                                   font=("Consolas", 10),
+                                                   bg="#1E293B",
+                                                   fg="#E2E8F0",
+                                                   insertbackground="#60A5FA",
+                                                   relief="flat",
+                                                   borderwidth=0)
+        self.log_text.pack(fill="both", expand=True, padx=12, pady=12)
 
-        tk.Button(log_frame, text="Wyczyść logi", command=self.clear_logs).pack(pady=5)
+        self.create_action_button(
+            log_frame,
+            text="🗑️ Wyczyść logi",
+            command=self.clear_logs,
+            variant="neutral"
+        ).pack(pady=8)
 
         # ZAKŁADKA 3: Ręczna obsługa (poprawiona)
-        manual_frame = tk.Frame(notebook)
-        notebook.add(manual_frame, text="Ręczna obsługa")
+        manual_frame = tk.Frame(notebook, bg="#F8FAFC")
+        notebook.add(manual_frame, text="🔧 Ręczna obsługa")
         self.create_manual_interface(manual_frame)
 
         # Status bar
-        self.status_bar = tk.Label(self, text="Gotowy", relief="sunken", anchor="w", bg="lightgray")
+        self.status_bar = tk.Label(self, 
+                                   text="✅ Gotowy", 
+                                   relief="flat", 
+                                   anchor="w", 
+                                   bg="#E2E8F0",
+                                   fg="#1E293B",
+                                   font=("Segoe UI", 10),
+                                   padx=10, pady=6)
         self.status_bar.pack(side="bottom", fill="x")
 
     def update_action_buttons_state(self):
@@ -1147,64 +1367,161 @@ class BatchProcessorApp(tk.Tk):
             self.device_tree.insert("", "end", text=device.name, values=values, tags=tags)
 
     def create_manual_interface(self, parent):
-        """Tworzy interfejs do ręcznej obsługi pojedynczego sterownika."""
+        """Tworzy nowoczesny interfejs do ręcznej obsługi pojedynczego sterownika."""
         
-        connection_frame = tk.LabelFrame(parent, text="Połączenie", padx=10, pady=10)
-        connection_frame.pack(fill="x", padx=10, pady=5)
-        tk.Label(connection_frame, text="Adres IP:").pack()
-        self.ip_entry = tk.Entry(connection_frame, width=20)
-        self.ip_entry.pack()
-        tk.Label(connection_frame, text="Hasło:").pack()
-        self.password_entry = tk.Entry(connection_frame, show="*", width=20)
-        self.password_entry.pack()
+        connection_frame = tk.LabelFrame(parent, 
+                                        text="  🔌 Połączenie  ", 
+                                        padx=15, pady=15,
+                                        font=('Segoe UI', 11, 'bold'),
+                                        fg="#1E293B",
+                                        bg="#F8FAFC",
+                                        relief="solid",
+                                        borderwidth=1)
+        connection_frame.pack(fill="x", padx=12, pady=8)
+        
+        tk.Label(connection_frame, 
+                text="Adres IP:", 
+                font=('Segoe UI', 10, 'bold'),
+                bg="#F8FAFC",
+                fg="#1E293B").pack(pady=(0,5))
+        self.ip_entry = tk.Entry(connection_frame, 
+                                width=25,
+                                font=('Segoe UI', 11),
+                                relief="solid",
+                                borderwidth=1)
+        self.ip_entry.pack(pady=(0,10))
+        
+        tk.Label(connection_frame, 
+                text="Hasło:", 
+                font=('Segoe UI', 10, 'bold'),
+                bg="#F8FAFC",
+                fg="#1E293B").pack(pady=(0,5))
+        self.password_entry = tk.Entry(connection_frame, 
+                                      show="*", 
+                                      width=25,
+                                      font=('Segoe UI', 11),
+                                      relief="solid",
+                                      borderwidth=1)
+        self.password_entry.pack(pady=(0,10))
         
         # DODANE: Typ sterownika dla ręcznej obsługi
-        tk.Label(connection_frame, text="Typ sterownika:").pack(pady=(10, 0))
+        tk.Label(connection_frame, 
+                text="Typ sterownika:", 
+                font=('Segoe UI', 10, 'bold'),
+                bg="#F8FAFC",
+                fg="#1E293B").pack(pady=(10, 5))
         self.manual_plc_type_var = tk.StringVar(value="2152")
-        plc_manual_frame = tk.Frame(connection_frame)
-        plc_manual_frame.pack()
-        tk.Radiobutton(plc_manual_frame, text="AXC F 2152", variable=self.manual_plc_type_var, value="2152").pack(side="left", padx=10)
-        tk.Radiobutton(plc_manual_frame, text="AXC F 3152", variable=self.manual_plc_type_var, value="3152").pack(side="left", padx=10)
+        plc_manual_frame = tk.Frame(connection_frame, bg="#F8FAFC")
+        plc_manual_frame.pack(pady=(0,10))
+        tk.Radiobutton(plc_manual_frame, 
+                      text="AXC F 2152", 
+                      variable=self.manual_plc_type_var, 
+                      value="2152",
+                      font=('Segoe UI', 10),
+                      bg="#F8FAFC",
+                      fg="#1E293B",
+                      selectcolor="#FFFFFF",
+                      activebackground="#F8FAFC").pack(side="left", padx=10)
+        tk.Radiobutton(plc_manual_frame, 
+                      text="AXC F 3152", 
+                      variable=self.manual_plc_type_var, 
+                      value="3152",
+                      font=('Segoe UI', 10),
+                      bg="#F8FAFC",
+                      fg="#1E293B",
+                      selectcolor="#FFFFFF",
+                      activebackground="#F8FAFC").pack(side="left", padx=10)
         
-        tk.Button(connection_frame, text="Odczytaj dane z PLC", command=self.manual_read_plc).pack(pady=10)
+        self.create_action_button(
+            connection_frame,
+            text="🔍 Odczytaj dane z PLC",
+            command=self.manual_read_plc,
+            variant="primary"
+        ).pack(pady=10)
         
-        self.manual_data_label = tk.Label(parent, text="Tutaj pojawią się dane z PLC.",
-                                         bg="lightyellow", relief="groove", justify="left",
-                                         font=("Courier", 9), wraplength=450, padx=10, pady=10)
-        self.manual_data_label.pack(fill="x", padx=10, pady=5)
+        self.manual_data_label = tk.Label(parent, 
+                                         text="Tutaj pojawią się dane z PLC.",
+                                         bg="#FFFFFF",
+                                         fg="#475569",
+                                         relief="solid",
+                                         borderwidth=1,
+                                         justify="left",
+                                         font=("Segoe UI", 10), 
+                                         wraplength=500, 
+                                         padx=15, pady=15,
+                                         anchor="nw")
+        self.manual_data_label.pack(fill="x", padx=12, pady=8)
         
         # Sekcja operacji ręcznych
-        operations_frame = tk.LabelFrame(parent, text="Operacje pojedyncze", padx=10, pady=10)
-        operations_frame.pack(fill="x", padx=10, pady=5)
+        operations_frame = tk.LabelFrame(parent, 
+                                        text="  ⚙️ Operacje pojedyncze  ", 
+                                        padx=15, pady=12,
+                                        font=('Segoe UI', 11, 'bold'),
+                                        fg="#1E293B",
+                                        bg="#F8FAFC",
+                                        relief="solid",
+                                        borderwidth=1)
+        operations_frame.pack(fill="x", padx=12, pady=8)
         
         # Strefa czasowa
-        tk.Button(operations_frame, text="🕐 Ustaw strefę czasową", 
-                 command=self.manual_set_timezone, bg="#FF9800", fg="white",
-                 font=("Arial", 10, "bold"), height=2).pack(fill="x", padx=5, pady=3)
+        self.create_action_button(
+            operations_frame,
+            text="🕐 Ustaw strefę czasową",
+            command=self.manual_set_timezone,
+            variant="warning"
+        ).pack(fill="x", padx=5, pady=3)
         
         # System Services
-        tk.Button(operations_frame, text="⚙️ Wyślij System Services", 
-                 command=self.manual_upload_system_services, bg="#9C27B0", fg="white",
-                 font=("Arial", 10, "bold"), height=2).pack(fill="x", padx=5, pady=3)
+        self.create_action_button(
+            operations_frame,
+            text="⚙️ Wyślij System Services",
+            command=self.manual_upload_system_services,
+            variant="info"
+        ).pack(fill="x", padx=5, pady=3)
         
         # Firmware
-        firmware_manual_frame = tk.LabelFrame(parent, text="Aktualizacja Firmware", padx=10, pady=10)
-        firmware_manual_frame.pack(fill="x", padx=10, pady=5)
+        firmware_manual_frame = tk.LabelFrame(parent, 
+                                             text="  🔄 Aktualizacja Firmware  ", 
+                                             padx=15, pady=12,
+                                             font=('Segoe UI', 11, 'bold'),
+                                             fg="#1E293B",
+                                             bg="#F8FAFC",
+                                             relief="solid",
+                                             borderwidth=1)
+        firmware_manual_frame.pack(fill="x", padx=12, pady=8)
         
-        tk.Button(firmware_manual_frame, text="Wybierz plik firmware", 
-                 command=self.select_manual_firmware).pack(pady=5)
+        self.create_action_button(
+            firmware_manual_frame,
+            text="📂 Wybierz plik firmware",
+            command=self.select_manual_firmware,
+            variant="neutral"
+        ).pack(pady=8)
         self.manual_firmware_path = tk.StringVar()
-        tk.Label(firmware_manual_frame, textvariable=self.manual_firmware_path, 
-                bg="lightgray", relief="sunken", wraplength=400).pack(pady=5, fill="x")
+        tk.Label(firmware_manual_frame, 
+                textvariable=self.manual_firmware_path, 
+                bg="#FFFFFF",
+                fg="#475569",
+                relief="solid",
+                borderwidth=1,
+                font=('Segoe UI', 10),
+                wraplength=500,
+                padx=10, pady=8,
+                anchor="w").pack(pady=8, fill="x", padx=5)
         
         manual_fw_buttons = tk.Frame(firmware_manual_frame)
         manual_fw_buttons.pack(pady=5)
-        tk.Button(manual_fw_buttons, text="📤 Wyślij firmware", 
-                 command=self.manual_upload_firmware, bg="#4CAF50", fg="white",
-                 font=("Arial", 10, "bold")).pack(side="left", padx=5)
-        tk.Button(manual_fw_buttons, text="🔄 Wykonaj aktualizację", 
-                 command=self.manual_execute_update, bg="#F44336", fg="white",
-                 font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        self.create_action_button(
+            manual_fw_buttons,
+            text="📤 Wyślij firmware",
+            command=self.manual_upload_firmware,
+            variant="success"
+        ).pack(side="left", padx=5)
+        self.create_action_button(
+            manual_fw_buttons,
+            text="🔄 Wykonaj aktualizację",
+            command=self.manual_execute_update,
+            variant="danger"
+        ).pack(side="left", padx=5)
 
     def select_excel(self):
         """Wybór pliku Excel."""
