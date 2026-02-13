@@ -4,6 +4,8 @@ from tkinter import filedialog, messagebox, ttk, scrolledtext
 import threading
 import os
 import time
+import socket
+import subprocess
 from datetime import datetime
 import pytz
 import sys
@@ -11,6 +13,7 @@ import openpyxl
 from openpyxl.styles import PatternFill, Font
 import queue
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # cd "C:\Users\dawid.wiselka\OneDrive - NOMAD ELECTRIC Sp. z o.o\Dokumenty\Farmy\Updater\all\PLC-UPDATE"
 # python FirmwareUpdater_listaExcel.py
@@ -19,17 +22,25 @@ from contextlib import contextmanager
 
 
 
-# Konfiguracja
+# Konfiguracja hardcoded (nie zmienia się)
 PLC_USER = "admin"
 ROOT_PASS = "12345"
 TIMEZONE = "Europe/Warsaw"
 SYSTEM_SERVICES_FILE = "Default.scm.config"
-RETRY_ATTEMPTS = 3
-RETRY_DELAY = 10
-SSH_KEEPALIVE_INTERVAL = 30
-POST_REBOOT_INITIAL_WAIT = 60
-POST_REBOOT_GLOBAL_TIMEOUT = 300
-POST_REBOOT_POLL_INTERVAL = 5
+
+# Domyślne wartości (będą w GUI)
+DEFAULT_SSH_TIMEOUT = 30
+DEFAULT_SSH_KEEPALIVE = 30
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_DELAY = 10
+DEFAULT_PAUSE_BETWEEN = 5
+DEFAULT_UPLOAD_TIMEOUT = 900  # 15 minut dla 300MB firmware
+DEFAULT_UPDATE_COMMAND_TIMEOUT = 600  # 10 minut dla update-axcf
+DEFAULT_IDLE_TIMEOUT = 60
+DEFAULT_POST_REBOOT_WAIT = 60
+DEFAULT_POST_REBOOT_TIMEOUT = 300
+DEFAULT_POST_REBOOT_POLL = 5
+DEFAULT_PARALLEL_WORKERS = 1
 
 def resource_path(relative_path):
     """Zwraca absolutną ścieżkę do pliku, działa również w exe PyInstaller."""
@@ -38,6 +49,31 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+def clean_ip_address(text):
+    """
+    Ekstraktuje adres IP z różnych formatów:
+    - https://192.168.1.100/config → 192.168.1.100
+    - 192.168.1.100:8080 → 192.168.1.100
+    - [192.168.1.100] → 192.168.1.100
+    """
+    import re
+    if not text:
+        return ""
+    
+    # Znajdź wzorzec IP (4 liczby oddzielone kropkami)
+    match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', text)
+    if match:
+        ip = match.group(1)
+        # Walidacja zakresów (0-255)
+        try:
+            parts = ip.split('.')
+            if all(0 <= int(p) <= 255 for p in parts):
+                return ip
+        except:
+            pass
+    
+    return text.strip()  # Fallback - zwróć oczyszczony tekst
 
 class FatalUpdateError(Exception):
     """Błąd krytyczny - operacja nie powinna być ponawiana (bez retry)."""
@@ -135,6 +171,20 @@ class BatchProcessorApp(tk.Tk):
         self.upload_log_progress = {}
         self.show_errors_only = tk.BooleanVar(value=False)
         
+        # Konfigurowalne ustawienia (domyślne wartości)
+        self.ssh_timeout = DEFAULT_SSH_TIMEOUT
+        self.ssh_keepalive = DEFAULT_SSH_KEEPALIVE
+        self.retry_attempts = DEFAULT_RETRY_ATTEMPTS
+        self.retry_delay = DEFAULT_RETRY_DELAY
+        self.pause_between_devices = DEFAULT_PAUSE_BETWEEN
+        self.upload_timeout = DEFAULT_UPLOAD_TIMEOUT
+        self.update_command_timeout = DEFAULT_UPDATE_COMMAND_TIMEOUT
+        self.idle_timeout = DEFAULT_IDLE_TIMEOUT
+        self.post_reboot_wait = DEFAULT_POST_REBOOT_WAIT
+        self.post_reboot_timeout = DEFAULT_POST_REBOOT_TIMEOUT
+        self.post_reboot_poll = DEFAULT_POST_REBOOT_POLL
+        self.parallel_workers = DEFAULT_PARALLEL_WORKERS
+        
         # Tworzenie GUI
         self.create_widgets()
 
@@ -188,6 +238,104 @@ class BatchProcessorApp(tk.Tk):
         return btn
 
 
+    def create_ssh_client(self, ip, password, timeout=None):
+        """Tworzy i konfiguruje klienta SSH z odpowiednimi timeoutami."""
+        if timeout is None:
+            timeout = self.ssh_timeout
+
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                ip,
+                username=PLC_USER,
+                password=password,
+                timeout=timeout,
+                banner_timeout=timeout,
+                auth_timeout=timeout,
+                allow_agent=False,
+                look_for_keys=False
+            )
+
+            transport = ssh.get_transport()
+            if transport:
+                transport.set_keepalive(self.ssh_keepalive)
+
+            return ssh
+        except paramiko.AuthenticationException as e:
+            diagnosis = self.diagnose_ssh_error(ip, e, timeout)
+            raise Exception(f"{diagnosis}: {str(e)}") from e
+        except ConnectionRefusedError as e:
+            diagnosis = self.diagnose_ssh_error(ip, e, timeout)
+            raise Exception(f"{diagnosis}: {str(e)}") from e
+        except socket.timeout as e:
+            diagnosis = self.diagnose_ssh_error(ip, e, timeout)
+            raise Exception(f"{diagnosis}: {str(e)}") from e
+        except TimeoutError as e:
+            diagnosis = self.diagnose_ssh_error(ip, e, timeout)
+            raise Exception(f"{diagnosis}: {str(e)}") from e
+        except Exception as e:
+            diagnosis = self.diagnose_ssh_error(ip, e, timeout)
+            raise Exception(f"{diagnosis}: {str(e)}") from e
+
+    def check_ping(self, ip):
+        """Sprawdza, czy host odpowiada na ping."""
+        try:
+            result = subprocess.run(
+                ["ping", "-n", "1", "-w", "1200", ip],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False
+            )
+            return result.returncode == 0
+        except Exception:
+            return None
+
+    def check_ssh_port(self, ip, timeout=None):
+        """Sprawdza dostępność portu SSH 22."""
+        if timeout is None:
+            timeout = self.ssh_timeout
+
+        sock = None
+        try:
+            sock = socket.create_connection((ip, 22), timeout=timeout)
+            return True, None
+        except ConnectionRefusedError:
+            return False, "Port zamknięty (firewall)"
+        except socket.timeout:
+            return False, "Timeout połączenia"
+        except OSError:
+            return False, "Host nieosiągalny (ping fail)"
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def diagnose_ssh_error(self, ip, error, timeout=None):
+        """Diagnostyka błędów SSH z rozróżnieniem przyczyn."""
+        if timeout is None:
+            timeout = self.ssh_timeout
+
+        error_msg = str(error).lower()
+
+        if isinstance(error, paramiko.AuthenticationException) or "authentication failed" in error_msg:
+            return "Błędne hasło"
+
+        ping_ok = self.check_ping(ip)
+        if ping_ok is False:
+            return "Host nieosiągalny (ping fail)"
+
+        port_open, port_reason = self.check_ssh_port(ip, timeout=min(timeout, 5))
+        if not port_open:
+            return port_reason
+
+        if isinstance(error, socket.timeout) or "timed out" in error_msg or "timeout" in error_msg:
+            return "Timeout połączenia"
+
+        return "Błąd połączenia SSH"
+
     @contextmanager
     def ssh_connection(self, device):
         """
@@ -202,33 +350,18 @@ class BatchProcessorApp(tk.Tk):
         sftp = None
         
         try:
-            self.log(f"  🔗 Otwieranie połączenia SSH do {device.ip}...")
-            
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(
-                device.ip, 
-                username=PLC_USER, 
-                password=device.password, 
-                timeout=30,
-                banner_timeout=30,
-                auth_timeout=30,
-                allow_agent=False,
-                look_for_keys=False
-            )
+            self.log(f"  Otwieranie połączenia SSH do {device.ip}...")
 
-            transport = ssh.get_transport()
-            if transport:
-                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
+            ssh = self.create_ssh_client(device.ip, device.password)
             
             sftp = ssh.open_sftp()
             
-            self.log(f"  ✓ Połączono z {device.ip}")
+            self.log(f"  Połączono z {device.ip}")
             
             yield ssh, sftp
             
         except Exception as e:
-            self.log(f"  ❌ Błąd połączenia SSH: {str(e)}")
+            self.log(f"  Błąd połączenia SSH: {str(e)}")
             raise
             
         finally:
@@ -237,10 +370,10 @@ class BatchProcessorApp(tk.Tk):
                 try:
                     sftp.close()
                     time.sleep(1)
-                    self.log(f"  🔒 Zamknięto SFTP")
+                    self.log(f"  Zamknięto SFTP")
                     time.sleep(0.3)
                 except Exception as e:
-                    self.log(f"  ⚠️  Błąd zamykania SFTP: {str(e)}")
+                    self.log(f"  UWAGA: Błąd zamykania SFTP: {str(e)}")
             
             # Zamknij SSH
             if ssh:
@@ -250,25 +383,25 @@ class BatchProcessorApp(tk.Tk):
                         transport.close()
                     ssh.close()
                     time.sleep(1)
-                    self.log(f"  🔒 Zamknięto SSH")
+                    self.log(f"  Zamknięto SSH")
                     time.sleep(1) 
                 except Exception as e:
-                    self.log(f"  ⚠️  Błąd zamykania SSH: {str(e)}")
+                    self.log(f"  UWAGA: Błąd zamykania SSH: {str(e)}")
 
     def wait_for_ssh_back(self, device):
         """Po restarcie czeka aktywnie na ponowną dostępność SSH sterownika."""
-        max_attempts = max(1, int(POST_REBOOT_GLOBAL_TIMEOUT / POST_REBOOT_POLL_INTERVAL))
+        max_attempts = max(1, int(self.post_reboot_timeout / self.post_reboot_poll))
         self.log(
-            f"  ⏳ Oczekiwanie po restarcie: start po {POST_REBOOT_INITIAL_WAIT}s, "
-            f"timeout globalny {POST_REBOOT_GLOBAL_TIMEOUT}s, "
+            f"  Oczekiwanie po restarcie: start po {self.post_reboot_wait}s, "
+            f"timeout globalny {self.post_reboot_timeout}s, "
             f"max prób reconnect: ~{max_attempts}"
         )
-        time.sleep(POST_REBOOT_INITIAL_WAIT)
+        time.sleep(self.post_reboot_wait)
 
         start_time = time.time()
         attempt = 0
 
-        while (time.time() - start_time) < POST_REBOOT_GLOBAL_TIMEOUT:
+        while (time.time() - start_time) < self.post_reboot_timeout:
             attempt += 1
             test_ssh = None
             try:
@@ -287,17 +420,25 @@ class BatchProcessorApp(tk.Tk):
 
                 transport = test_ssh.get_transport()
                 if transport:
-                    transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
+                    transport.set_keepalive(self.ssh_keepalive)
 
-                self.log(f"  ✓ Sterownik {device.ip} wrócił online (próba {attempt})")
+                self.log(f"  Sterownik {device.ip} wrócił online (próba {attempt})")
                 return True
-            except Exception:
+            except (paramiko.AuthenticationException, ConnectionRefusedError, socket.timeout, TimeoutError, OSError) as e:
+                elapsed = int(time.time() - start_time)
+                reason = self.diagnose_ssh_error(device.ip, e, timeout=10)
+                self.log(
+                    f"  Reconnect próba {attempt}/{max_attempts} nieudana "
+                    f"({elapsed}s/{self.post_reboot_timeout}s): {reason}"
+                )
+                time.sleep(self.post_reboot_poll)
+            except Exception as e:
                 elapsed = int(time.time() - start_time)
                 self.log(
-                    f"  ⏳ Reconnect próba {attempt}/{max_attempts} nieudana "
-                    f"({elapsed}s/{POST_REBOOT_GLOBAL_TIMEOUT}s)"
+                    f"  Reconnect próba {attempt}/{max_attempts} nieudana "
+                    f"({elapsed}s/{self.post_reboot_timeout}s): {str(e)}"
                 )
-                time.sleep(POST_REBOOT_POLL_INTERVAL)
+                time.sleep(self.post_reboot_poll)
             finally:
                 if test_ssh:
                     try:
@@ -306,7 +447,7 @@ class BatchProcessorApp(tk.Tk):
                         pass
 
         raise Exception(
-            f"Sterownik nie wrócił online po {POST_REBOOT_GLOBAL_TIMEOUT}s "
+            f"Sterownik nie wrócił online po {self.post_reboot_timeout}s "
             f"od pierwszej próby połączenia (wykonano {attempt} prób reconnect)"
         )
 
@@ -329,28 +470,15 @@ class BatchProcessorApp(tk.Tk):
         ssh = None
         channel = None
         try:
-            self.log(f"  🔗 Nowe połączenie SSH dla firmware update...")
-            
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(
-                device.ip, 
-                username=PLC_USER, 
-                password=device.password, 
-                timeout=30,
-                banner_timeout=30,
-                auth_timeout=30,
-                allow_agent=False,
-                look_for_keys=False
-            )
+            device.status = "Aktualizacja firmware..."
+            self.after(0, lambda d=device: self.update_device_row(d))
+            self.log(f"  Nowe połączenie SSH dla firmware update...")
 
-            transport = ssh.get_transport()
-            if transport:
-                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
+            ssh = self.create_ssh_client(device.ip, device.password)
             
             update_command = f"sudo update-axcf{device.plc_model}"
-            self.log(f"  ⚠️ Uruchamiam: {update_command}")
-            self.log(f"  ⏳ Czekam na zakończenie procesu update (może zająć kilka minut)...")
+            self.log(f"  Uruchamiam: {update_command}")
+            self.log(f"  Czekam na zakończenie procesu update (może zająć kilka minut)...")
             
             channel = ssh.get_transport().open_session()
             channel.get_pty()
@@ -359,11 +487,11 @@ class BatchProcessorApp(tk.Tk):
             
             output = ""
             start_time = time.time()
-            timeout = 300  # 5 minut
+            timeout = self.update_command_timeout
             
             while True:
                 if time.time() - start_time > timeout:
-                    self.log("  ⚠️ Timeout - przekroczono 5 minut oczekiwania")
+                    self.log(f"  UWAGA: Timeout - przekroczono {timeout}s oczekiwania")
                     break
                 
                 if channel.recv_ready():
@@ -376,10 +504,10 @@ class BatchProcessorApp(tk.Tk):
                 
                 if channel.exit_status_ready():
                     exit_code = channel.recv_exit_status()
-                    self.log(f"  ✓ Proces zakończony z kodem: {exit_code}")
+                    self.log(f"  Proces zakończony z kodem: {exit_code}")
                     
                     if exit_code != 0:
-                            self.log(f"  ⚠️ Exit code: {exit_code} (może być normalne przy reboot)")
+                            self.log(f"  UWAGA: Exit code: {exit_code} (może być normalne przy reboot)")
                     break
                 
                 time.sleep(0.5)
@@ -387,9 +515,11 @@ class BatchProcessorApp(tk.Tk):
             if channel.recv_stderr_ready():
                 errors = channel.recv_stderr(4096).decode(errors="ignore")
                 if errors.strip():
-                    self.log(f"  ⚠️ Stderr: {errors[:200]}")
+                    self.log(f"  UWAGA: Stderr: {errors[:200]}")
             
-            self.log("  ✓ Aktualizacja firmware zakończona. Sterownik restartuje się")
+            self.log("  Aktualizacja firmware zakończona. Sterownik restartuje się")
+            device.status = "Oczekiwanie na restart..."
+            self.after(0, lambda d=device: self.update_device_row(d))
             self.wait_for_ssh_back(device)
             
         except Exception as e:
@@ -398,7 +528,7 @@ class BatchProcessorApp(tk.Tk):
             if channel:
                 try:
                     channel.close()
-                    self.log("  🔒 Zamknięto kanał SSH")
+                    self.log("  Zamknięto kanał SSH")
                 except:
                     pass
             
@@ -409,7 +539,7 @@ class BatchProcessorApp(tk.Tk):
                         transport.close()
                     ssh.close()
                     time.sleep(1)
-                    self.log("  🔒 Zamknięto SSH")
+                    self.log("  Zamknięto SSH")
                 except:
                     pass
             
@@ -418,26 +548,13 @@ class BatchProcessorApp(tk.Tk):
     def execute_reboot(self, device):
         ssh = None
         try:
-            self.log(f"  🔗 Nowe połączenie SSH dla reboot...")
-            
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(
-                device.ip, 
-                username=PLC_USER, 
-                password=device.password, 
-                timeout=30,
-                banner_timeout=30,
-                auth_timeout=30,
-                allow_agent=False,
-                look_for_keys=False
-            )
+            device.status = "Oczekiwanie na restart..."
+            self.after(0, lambda d=device: self.update_device_row(d))
+            self.log(f"  Nowe połączenie SSH dla reboot...")
 
-            transport = ssh.get_transport()
-            if transport:
-                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
+            ssh = self.create_ssh_client(device.ip, device.password)
             
-            self.log("  ⚠️ Uruchamiam 'sudo reboot'...")
+            self.log("  Uruchamiam 'sudo reboot'...")
             
             stdin, stdout, stderr = ssh.exec_command("sudo reboot", get_pty=True)
             stdin.write(device.password + "\n")
@@ -447,7 +564,7 @@ class BatchProcessorApp(tk.Tk):
         except Exception as e:
             # Ignoruj błędy zamknięcia - reboot ich powoduje
             if "Socket is closed" in str(e) or "Timeout" in str(e) or "EOF" in str(e):
-                self.log("  ✓ Reboot zainicjowany (połączenie przerwane - oczekiwane)")
+                self.log("  Reboot zainicjowany (połączenie przerwane - oczekiwane)")
             else:
                 raise e
         finally:
@@ -455,7 +572,7 @@ class BatchProcessorApp(tk.Tk):
                 try:
                     ssh.close()
                     time.sleep(1)
-                    self.log("  🔒 Zamknięto SSH po reboot")
+                    self.log("  Zamknięto SSH po reboot")
                 except:
                     pass
             time.sleep(1)
@@ -465,7 +582,7 @@ class BatchProcessorApp(tk.Tk):
 
 
 
-    def upload_callback(self, filename, transferred, total):
+    def upload_callback(self, filename, transferred, total, device=None):
         """
         Callback wywoływany podczas uploadu pliku przez SFTP.
         Aktualizuje progress bar i status.
@@ -481,7 +598,11 @@ class BatchProcessorApp(tk.Tk):
             total_mb = total / 1024 / 1024
             
             # Formatuj status
-            status_text = f"📤 {filename}: {transferred_mb:.1f} MB / {total_mb:.1f} MB ({percent:.1f}%)"
+            status_text = f"{filename}: {transferred_mb:.1f} MB / {total_mb:.1f} MB ({percent:.1f}%)"
+
+            if device:
+                device.status = f"Wysyłanie pliku ({int(percent)}%)..."
+                self.after(0, lambda d=device: self.update_device_row(d))
             
             # Aktualizuj GUI (thread-safe)
             self.after(0, lambda: self.upload_status_label.config(
@@ -495,7 +616,97 @@ class BatchProcessorApp(tk.Tk):
 
             if progress_threshold >= 10 and progress_threshold > last_logged:
                 self.upload_log_progress[filename] = progress_threshold
-                self.log(f"  📊 Upload: {progress_threshold}% ({transferred_mb:.1f}/{total_mb:.1f} MB)")
+                self.log(f"  Upload: {progress_threshold}% ({transferred_mb:.1f}/{total_mb:.1f} MB)")
+
+    def upload_file_with_resume(self, sftp, local_path, remote_path, device=None):
+        """Upload z obsługą .partial, wznowieniem i timeoutami postępu."""
+        filename = os.path.basename(local_path)
+        remote_partial_path = f"{remote_path}.partial"
+        local_size = os.path.getsize(local_path)
+
+        if local_size <= 0:
+            raise Exception(f"Nieprawidłowy rozmiar pliku: {filename}")
+
+        resume_offset = 0
+        try:
+            resume_offset = sftp.stat(remote_partial_path).st_size
+        except FileNotFoundError:
+            resume_offset = 0
+        except IOError:
+            resume_offset = 0
+
+        if resume_offset > local_size:
+            self.log(f"  UWAGA: Plik .partial większy niż lokalny. Usuwam i zaczynam od zera: {remote_partial_path}")
+            sftp.remove(remote_partial_path)
+            resume_offset = 0
+
+        if resume_offset > 0:
+            self.log(
+                f"  Wznawianie transferu od {resume_offset/1024/1024:.1f} MB "
+                f"z {local_size/1024/1024:.1f} MB"
+            )
+        else:
+            self.log(f"  Start transferu: {filename} ({local_size/1024/1024:.1f} MB)")
+
+        transfer_start = time.time()
+        transferred = resume_offset
+        chunk_size = 64 * 1024
+
+        channel = sftp.get_channel()
+        channel.settimeout(self.idle_timeout)
+
+        mode = 'ab' if resume_offset > 0 else 'wb'
+        try:
+            with open(local_path, 'rb') as local_file:
+                local_file.seek(resume_offset)
+                with sftp.open(remote_partial_path, mode) as remote_file:
+                    while transferred < local_size:
+                        elapsed = time.time() - transfer_start
+                        if elapsed > self.upload_timeout:
+                            raise TimeoutError(
+                                f"Timeout uploadu: przekroczono {self.upload_timeout}s "
+                                f"dla pliku {filename}"
+                            )
+
+                        data = local_file.read(chunk_size)
+                        if not data:
+                            break
+
+                        try:
+                            remote_file.write(data)
+                            remote_file.flush()
+                        except socket.timeout as e:
+                            raise TimeoutError(
+                                f"Brak postępu transferu przez {self.idle_timeout}s "
+                                f"(idle timeout)"
+                            ) from e
+
+                        transferred += len(data)
+                        self.upload_callback(filename, transferred, local_size, device=device)
+        finally:
+            channel.settimeout(None)
+
+        remote_partial_size = sftp.stat(remote_partial_path).st_size
+        if remote_partial_size != local_size:
+            raise Exception(
+                f"Transfer niepełny! Lokalny: {local_size}, Zdalny .partial: {remote_partial_size}"
+            )
+
+        try:
+            sftp.remove(remote_path)
+        except FileNotFoundError:
+            pass
+        except IOError:
+            pass
+
+        sftp.rename(remote_partial_path, remote_path)
+
+        remote_size = sftp.stat(remote_path).st_size
+        if remote_size != local_size:
+            raise Exception(f"Weryfikacja po rename nieudana! Lokalny: {local_size}, Zdalny: {remote_size}")
+
+        self.log(f"  Transfer ukończony: {filename}")
+        return remote_size
 
     def reset_upload_progress(self):
         """Resetuje progress bar po zakończeniu uploadu."""
@@ -520,10 +731,101 @@ class BatchProcessorApp(tk.Tk):
         success_count = 0
         failed_count = 0
         failed_devices = []
+        max_workers = max(1, min(5, int(self.parallel_workers)))
+
+        def process_single_device(idx, device):
+            if not self.processing:
+                return "not_processed", "Operacja zatrzymana"
+
+            self.log(f"\n{'='*60}")
+            self.log(f"[{idx}/{total}] Przetwarzanie: {device.name} ({device.ip})")
+            self.log(f"{'='*60}")
+
+            device.status = "W trakcie"
+            device.error_log = ""
+            self.after(0, lambda d=device: self.update_device_row(d))
+
+            attempt = 0
+            success = False
+            last_error = ""
+
+            while attempt < self.retry_attempts and not success:
+                if not self.processing:
+                    return "not_processed", "Operacja zatrzymana"
+
+                attempt += 1
+
+                if attempt > 1:
+                    self.log(
+                        f"Retry próba {attempt}/{self.retry_attempts} "
+                        f"(pozostało {self.retry_attempts - attempt + 1} prób)"
+                    )
+                    time.sleep(self.retry_delay)
+
+                try:
+                    if operation == "read":
+                        self.read_single_device(device)
+                        success = True
+
+                    elif operation == "system_services":
+                        self.update_system_services_only(device)
+                        success = True
+
+                    elif operation == "timezone":
+                        self.update_timezone_only(device)
+                        success = True
+
+                    elif operation == "firmware":
+                        self.update_firmware_only_operation(device)
+                        success = True
+
+                    elif operation == "all":
+                        self.update_all_operations(device)
+                        success = True
+
+                    if success:
+                        device.status = "OK"
+                        self.log(f"[{device.name}] Operacja zakończona sukcesem")
+                        return "success", ""
+
+                except Exception as e:
+                    error_msg = str(e)
+                    last_error = error_msg
+                    device.error_log = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {error_msg}"
+
+                    if self.is_fatal_error(e):
+                        device.status = "Błąd"
+                        self.log(f"[{device.name}] Błąd krytyczny (bez retry): {error_msg}")
+                        return "failed", error_msg
+
+                    if self.is_transient_error(e) and attempt < self.retry_attempts:
+                        self.log(
+                            f"Błąd tymczasowy (próba {attempt}/{self.retry_attempts}): {error_msg}"
+                        )
+                        self.log(
+                            f"  Kolejny retry za {self.retry_delay}s "
+                            f"(pozostało {self.retry_attempts - attempt} prób)"
+                        )
+                    else:
+                        device.status = "Błąd"
+                        if self.is_transient_error(e):
+                            self.log(f"[{device.name}] Operacja nieudana po {self.retry_attempts} próbach: {error_msg}")
+                        else:
+                            self.log(f"[{device.name}] Błąd nienaprawialny (bez retry): {error_msg}")
+                        return "failed", error_msg
+                finally:
+                    self.after(0, lambda d=device: self.update_device_row(d))
+
+            if not success:
+                device.status = "Błąd"
+                return "failed", last_error or "Nieznany błąd"
+
+            return "success", ""
         
         self.log(f"{'='*60}")
-        self.log(f"🚀 START OPERACJI WSADOWEJ: {operation.upper()}")
-        self.log(f"📊 Liczba sterowników: {total}")
+        self.log(f"START OPERACJI WSADOWEJ: {operation.upper()}")
+        self.log(f"Liczba sterowników: {total}")
+        self.log(f"Tryb równoległy: {max_workers} worker(ów)")
         self.log(f"{'='*60}")
 
         self.after(0, lambda: self.batch_progress.config(value=0))
@@ -532,108 +834,42 @@ class BatchProcessorApp(tk.Tk):
             fg="#3B82F6"
         ))
         
-        for idx, device in enumerate(self.devices, 1):
-            if not self.processing:
-                self.log("⏹️  Operacja zatrzymana przez użytkownika")
-                break
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
 
-            progress_before = ((idx - 1) / total) * 100 if total else 0
-            self.after(0, lambda p=progress_before: self.batch_progress.config(value=p))
-            self.after(0, lambda i=idx, t=total, d=device: self.batch_progress_label.config(
-                text=f"Sterownik {i}/{t}: {d.name} ({d.ip})",
-                fg="#3B82F6"
-            ))
-            
-            # OPÓŹNIENIE MIĘDZY STEROWNIKAMI (oprócz pierwszego)
-            if idx > 1:
-                self.log(f"\n⏳ Czekam 5 sekund przed kolejnym sterownikiem...")
-                time.sleep(5)
-            
-            self.log(f"\n{'='*60}")
-            self.log(f"[{idx}/{total}] 🔧 Przetwarzanie: {device.name} ({device.ip})")
-            self.log(f"{'='*60}")
-            
-            device.status = "W trakcie..."
-            device.error_log = ""
-            self.after(0, lambda d=device: self.update_device_row(d))
-            
-            attempt = 0
-            success = False
-            
-            while attempt < RETRY_ATTEMPTS and not success:
-                attempt += 1
-                
-                if attempt > 1:
-                    self.log(
-                        f"⚠️  Retry próba {attempt}/{RETRY_ATTEMPTS} "
-                        f"(pozostało {RETRY_ATTEMPTS - attempt + 1} prób)"
-                    )
-                    time.sleep(RETRY_DELAY)
-                
+            for idx, device in enumerate(self.devices, 1):
+                if not self.processing:
+                    self.log("Operacja zatrzymana przez użytkownika")
+                    break
+
+                if idx > 1 and self.pause_between_devices > 0:
+                    self.log(f"\nCzekam {self.pause_between_devices} sekund przed kolejnym sterownikiem...")
+                    time.sleep(self.pause_between_devices)
+
+                future = executor.submit(process_single_device, idx, device)
+                futures[future] = device
+
+            for future in as_completed(futures):
+                device = futures[future]
                 try:
-                    if operation == "read":
-                        self.read_single_device(device)
-                        success = True
-                        
-                    elif operation == "system_services":
-                        self.update_system_services_only(device)
-                        success = True
-                        
-                    elif operation == "timezone":
-                        self.update_timezone_only(device)
-                        success = True
-                        
-                    elif operation == "firmware":
-                        self.update_firmware_only_operation(device)
-                        success = True
-                        
-                    elif operation == "all":
-                        self.update_all_operations(device)
-                        success = True
-                    
-                    if success:
-                        device.status = "✓ OK"
-                        success_count += 1
-                        self.log(f"✓ [{device.name}] Operacja zakończona sukcesem")
-                        
+                    result_status, error_msg = future.result()
                 except Exception as e:
-                    error_msg = str(e)
-                    device.error_log = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {error_msg}"
+                    result_status, error_msg = "failed", str(e)
 
-                    if self.is_fatal_error(e):
-                        device.status = "✗ Błąd"
-                        failed_count += 1
-                        failed_devices.append((device.name, error_msg))
-                        self.log(f"✗ [{device.name}] Błąd krytyczny (bez retry): {error_msg}")
-                        break
+                if result_status == "success":
+                    success_count += 1
+                elif result_status == "failed":
+                    failed_count += 1
+                    failed_devices.append((device.name, error_msg))
 
-                    if self.is_transient_error(e) and attempt < RETRY_ATTEMPTS:
-                        self.log(
-                            f"✗ Błąd tymczasowy (próba {attempt}/{RETRY_ATTEMPTS}): {error_msg}"
-                        )
-                        self.log(
-                            f"  ⏳ Kolejny retry za {RETRY_DELAY}s "
-                            f"(pozostało {RETRY_ATTEMPTS - attempt} prób)"
-                        )
-                    else:
-                        device.status = "✗ Błąd"
-                        failed_count += 1
-                        failed_devices.append((device.name, error_msg))
-                        if self.is_transient_error(e):
-                            self.log(f"✗ [{device.name}] Operacja nieudana po {RETRY_ATTEMPTS} próbach: {error_msg}")
-                        else:
-                            self.log(f"✗ [{device.name}] Błąd nienaprawialny (bez retry): {error_msg}")
-                        break
-                
-                finally:
-                    self.after(0, lambda d=device: self.update_device_row(d))
-
-            progress_after = (idx / total) * 100 if total else 0
-            self.after(0, lambda p=progress_after: self.batch_progress.config(value=p))
-            self.after(0, lambda i=idx, t=total: self.batch_progress_label.config(
-                text=f"Postęp: {i}/{t} sterowników",
-                fg="#3B82F6"
-            ))
+                completed += 1
+                progress_after = (completed / total) * 100 if total else 0
+                self.after(0, lambda p=progress_after: self.batch_progress.config(value=p))
+                self.after(0, lambda c=completed, t=total: self.batch_progress_label.config(
+                    text=f"Postęp: {c}/{t} sterowników",
+                    fg="#3B82F6"
+                ))
 
         processed_count = success_count + failed_count
         not_processed_count = max(0, total - processed_count)
@@ -650,27 +886,27 @@ class BatchProcessorApp(tk.Tk):
         
         # Podsumowanie
         self.log(f"\n{'='*60}")
-        self.log(f"📊 PODSUMOWANIE OPERACJI: {operation.upper()}")
+        self.log(f"PODSUMOWANIE OPERACJI: {operation.upper()}")
         self.log(f"{'='*60}")
-        self.log(f"✓ Sukces: {success_count}/{total}")
-        self.log(f"✗ Błędy: {failed_count}/{total}")
-        self.log(f"⏭️ Nieprzetworzone: {not_processed_count}/{total}")
+        self.log(f"Sukces: {success_count}/{total}")
+        self.log(f"Błędy: {failed_count}/{total}")
+        self.log(f"Nieprzetworzone: {not_processed_count}/{total}")
         if failed_devices:
-            self.log("⚠️ Lista nieudanych sterowników:")
+            self.log("Lista nieudanych sterowników:")
             for name, err in failed_devices[:10]:
                 self.log(f"   - {name}: {err[:120]}")
             if len(failed_devices) > 10:
                 self.log(f"   ... i {len(failed_devices) - 10} więcej")
 
         if recommendations:
-            self.log("💡 Rekomendacje:")
+            self.log("Rekomendacje:")
             for recommendation in recommendations:
                 self.log(f"   {recommendation}")
         self.log(f"{'='*60}\n")
         
         self.processing = False
         self.after(0, self.update_action_buttons_state)
-        self.after(0, lambda: self.status_bar.config(text="✅ Gotowy"))
+        self.after(0, lambda: self.status_bar.config(text="Gotowy"))
         self.after(0, lambda: self.batch_progress_label.config(
             text=f"Zakończono: sukces {success_count}, błędy {failed_count}, nieprzetworzone {not_processed_count}",
             fg="#10B981" if failed_count == 0 else "#EF4444"
@@ -680,9 +916,9 @@ class BatchProcessorApp(tk.Tk):
         self.after(0, lambda: messagebox.showinfo(
             "Operacja zakończona",
             f"Operacja: {operation.upper()}\n\n"
-            f"✓ Sukces: {success_count}/{total}\n"
-            f"✗ Błędy: {failed_count}/{total}\n"
-            f"⏭️ Nieprzetworzone: {not_processed_count}/{total}\n\n"
+            f"Sukces: {success_count}/{total}\n"
+            f"Błędy: {failed_count}/{total}\n"
+            f"Nieprzetworzone: {not_processed_count}/{total}\n\n"
             f"Sprawdź logi i zakładkę tabeli, aby uzyskać szczegóły."
         ))
 
@@ -692,16 +928,23 @@ class BatchProcessorApp(tk.Tk):
         Odczytuje dane z pojedynczego sterownika.
         """
         try:
+            device.status = "Łączenie SSH..."
+            self.after(0, lambda d=device: self.update_device_row(d))
+            
             with self.ssh_connection(device) as (ssh, sftp):
                 
                 # 1. Wykryj model PLC
+                device.status = "Wykrywanie modelu..."
+                self.after(0, lambda d=device: self.update_device_row(d))
                 device.plc_model = self.detect_plc_model(ssh)
                 
                 # 2. Wersja Firmware
+                device.status = "Odczyt firmware..."
+                self.after(0, lambda d=device: self.update_device_row(d))
                 stdin, stdout, stderr = ssh.exec_command("grep Arpversion /etc/plcnext/arpversion")
                 fw_output = stdout.read().decode().strip()
                 
-                self.log(f"  🔍 Surowy output wersji firmware: '{fw_output}'")
+                self.log(f"  Surowy output wersji firmware: '{fw_output}'")
                 
                 version_string = "?"
                 if fw_output:
@@ -715,57 +958,70 @@ class BatchProcessorApp(tk.Tk):
                     else:
                         version_string = fw_output.strip()
                     
-                    self.log(f"  🔍 Sparsowana wersja: '{version_string}'")
+                    self.log(f"  Sparsowana wersja: '{version_string}'")
                 
                 if version_string and version_string != "?" and version_string[0].isdigit():
                     device.firmware_version = version_string
                 else:
                     device.firmware_version = "?"
-                    self.log(f"  ⚠️  Nie można odczytać poprawnej wersji firmware!")
+                    self.log(f"  UWAGA: Nie można odczytać poprawnej wersji firmware!")
                 
                 # 3. Strefa czasowa
+                device.status = "Sprawdzanie strefy czasowej..."
+                self.after(0, lambda d=device: self.update_device_row(d))
                 stdin, stdout, stderr = ssh.exec_command("cat /etc/timezone")
                 device.timezone = stdout.read().decode(errors="ignore").strip()
                 
                 # 4. Sprawdzenie synchronizacji czasu
+                device.status = "Sprawdzanie synchronizacji czasu..."
+                self.after(0, lambda d=device: self.update_device_row(d))
                 plc_time_obj, plc_time_str, is_synced = self.check_time_sync(ssh)
                 device.plc_time = plc_time_str
                 device.time_sync_error = not is_synced
                 
-                # 5. System Services
+                # 5. System Services - porównanie zawartości pliku
+                device.status = "Sprawdzanie System Services..."
+                self.after(0, lambda d=device: self.update_device_row(d))
                 try:
                     remote_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
-                    remote_stat = sftp.stat(remote_path)
                     
                     local_file = resource_path(SYSTEM_SERVICES_FILE)
                     if os.path.exists(local_file):
-                        local_size = os.path.getsize(local_file)
-                        remote_size = remote_stat.st_size
+                        # Odczytaj lokalny plik
+                        with open(local_file, 'rb') as f:
+                            local_content = f.read()
                         
-                        if local_size == remote_size:
+                        # Pobierz zawartość zdalnego pliku
+                        with sftp.open(remote_path, 'r') as remote_file:
+                            remote_content = remote_file.read()
+                        
+                        # Porównaj zawartość (jako bytes)
+                        if local_content == remote_content:
                             device.system_services_ok = "OK"
+                            self.log(f"  System Services - zawartość zgodna")
                         else:
-                            device.system_services_ok = "Różnica"
-                            self.log(f"  ⚠️  System Services - różnica rozmiaru: lokalny={local_size}, zdalny={remote_size}")
+                            device.system_services_ok = "Niezgodność"
+                            self.log(f"  UWAGA: System Services - zawartość różni się od wzorcowej")
                     else:
-                        device.system_services_ok = "Istnieje"
+                        device.system_services_ok = "Brak lokalnego"
+                        self.log(f"  UWAGA: Brak lokalnego pliku wzorcowego: {SYSTEM_SERVICES_FILE}")
                         
                 except FileNotFoundError:
                     device.system_services_ok = "Brak"
-                    self.log(f"  ⚠️  Plik System Services nie istnieje na sterowniku")
+                    self.log(f"  UWAGA: Plik System Services nie istnieje na sterowniku")
                 except Exception as e:
                     device.system_services_ok = "Błąd"
-                    self.log(f"  ⚠️  Błąd sprawdzania System Services: {str(e)}")
+                    self.log(f"  UWAGA: Błąd sprawdzania System Services: {str(e)}")
                 
                 # 6. Znacznik czasowy odczytu
                 device.last_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
                 # Logowanie podsumowania
-                self.log(f"  📦 Model: AXC F {device.plc_model}")
-                self.log(f"  📦 Firmware: {device.firmware_version}")
-                self.log(f"  🕐 Czas PLC: {device.plc_time}")
-                self.log(f"  🌍 Strefa czasowa: {device.timezone}")
-                self.log(f"  ⚙️  System Services: {device.system_services_ok}")
+                self.log(f"  Model: AXC F {device.plc_model}")
+                self.log(f"  Firmware: {device.firmware_version}")
+                self.log(f"  Czas PLC: {device.plc_time}")
+                self.log(f"  Strefa czasowa: {device.timezone}")
+                self.log(f"  System Services: {device.system_services_ok}")
                 
             # Context manager automatycznie zamknie SSH/SFTP tutaj
             
@@ -794,14 +1050,14 @@ class BatchProcessorApp(tk.Tk):
                         # Wyciągamy numer modelu (2152, 3152, 1152)
                         if 'axcf' in compatible:
                             model = compatible.replace('axcf', '').split('_')[0]
-                            self.log(f"  🔍 Wykryty model PLC: AXC F {model}")
+                            self.log(f"  Wykryty model PLC: AXC F {model}")
                             return model
             
-            self.log(f"  ⚠️  Nie można wykryć modelu z 'rauc status'")
+            self.log(f"  UWAGA: Nie można wykryć modelu z 'rauc status'")
             return None
             
         except Exception as e:
-            self.log(f"  ⚠️  Błąd wykrywania modelu: {str(e)}")
+            self.log(f"  UWAGA: Błąd wykrywania modelu: {str(e)}")
             return None
 
     def extract_model_from_firmware(self, firmware_path):
@@ -844,7 +1100,7 @@ class BatchProcessorApp(tk.Tk):
             plc_time_str = stdout.read().decode(errors="ignore").strip()
             
             if not plc_time_str:
-                self.log(f"  ⚠️ Nie można odczytać czasu ze sterownika")
+                self.log(f"  UWAGA: Nie można odczytać czasu ze sterownika")
                 return None, "", False
             
             # Parsuj czas sterownika
@@ -861,14 +1117,14 @@ class BatchProcessorApp(tk.Tk):
             is_synced = time_diff < 60
             
             if not is_synced:
-                self.log(f"  ⚠️ DESYNCHRONIZACJA CZASU: różnica {time_diff:.0f}s")
+                self.log(f"  UWAGA: DESYNCHRONIZACJA CZASU: różnica {time_diff:.0f}s")
                 self.log(f"    Sterownik: {plc_time_str}")
                 self.log(f"    Lokalny: {local_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
             return plc_time, plc_time_str, is_synced
             
         except Exception as e:
-            self.log(f"  ⚠️ Błąd sprawdzania czasu: {str(e)}")
+            self.log(f"  UWAGA: Błąd sprawdzania czasu: {str(e)}")
             return None, "", False
 
     def compare_firmware_versions(self, current_version, target_version):
@@ -878,16 +1134,16 @@ class BatchProcessorApp(tk.Tk):
         """
         target_version_number = self.get_target_fw_version(target_version)
         
-        self.log(f"  🔍 Porównanie wersji firmware:")
+        self.log(f"  Porównanie wersji firmware:")
         self.log(f"     Aktualna wersja na sterowniku: '{current_version}'")
         self.log(f"     Wersja z pliku firmware: '{target_version_number}'")
         
         if not current_version or current_version == "?":
-            self.log(f"     ⚠️  Nie można odczytać aktualnej wersji - wymuszam aktualizację")
+            self.log(f"     UWAGA: Nie można odczytać aktualnej wersji - wymuszam aktualizację")
             return False 
         
         if not target_version_number:
-            self.log(f"     ⚠️  Nie można odczytać wersji z pliku - wymuszam aktualizację")
+            self.log(f"     UWAGA: Nie można odczytać wersji z pliku - wymuszam aktualizację")
             return False
         
         # Normalizacja: usuń białe znaki i porównaj
@@ -897,9 +1153,9 @@ class BatchProcessorApp(tk.Tk):
         is_same = current_clean == target_clean
         
         if is_same:
-            self.log(f"     ✅ Wersje są IDENTYCZNE - aktualizacja NIE jest potrzebna")
+            self.log(f"     Wersje są IDENTYCZNE - aktualizacja NIE jest potrzebna")
         else:
-            self.log(f"     ⚠️  Wersje są RÓŻNE - aktualizacja jest potrzebna")
+            self.log(f"     UWAGA: Wersje są RÓŻNE - aktualizacja jest potrzebna")
             self.log(f"        Różnica: '{current_clean}' != '{target_clean}'")
         
         return is_same
@@ -919,10 +1175,10 @@ class BatchProcessorApp(tk.Tk):
         # Ostatnia część to wersja (np. '24.0.8.183')
         if len(parts) >= 3:
             version = parts[-1]
-            self.log(f"  🔍 Wykryta wersja firmware z pliku: {version}")
+            self.log(f"  Wykryta wersja firmware z pliku: {version}")
             return version
         
-        self.log(f"  ⚠️  Nie można odczytać wersji z nazwy pliku: {filename}")
+        self.log(f"  UWAGA: Nie można odczytać wersji z nazwy pliku: {filename}")
         return ""
 
     def create_widgets(self):
@@ -934,11 +1190,11 @@ class BatchProcessorApp(tk.Tk):
         
         # ZAKŁADKA 1: Przetwarzanie wsadowe
         batch_frame = tk.Frame(notebook, bg="#F8FAFC")
-        notebook.add(batch_frame, text="📊 Przetwarzanie wsadowe")
+        notebook.add(batch_frame, text="Przetwarzanie wsadowe")
         
         # Sekcja pliku Excel
         excel_frame = tk.LabelFrame(batch_frame, 
-                                    text="  📁 Plik Excel z listą sterowników  ", 
+                                    text="  Plik Excel z listą sterowników  ", 
                                     padx=15, pady=12,
                                     font=('Segoe UI', 11, 'bold'),
                                     fg="#1E293B",
@@ -949,7 +1205,7 @@ class BatchProcessorApp(tk.Tk):
         
         self.create_action_button(
             excel_frame,
-            text="📂 Wybierz plik Excel",
+            text="Wybierz plik Excel",
             command=self.select_excel,
             variant="neutral"
         ).pack(side="left", padx=5)
@@ -967,7 +1223,7 @@ class BatchProcessorApp(tk.Tk):
 
         self.load_excel_btn = self.create_action_button(
             excel_frame,
-            text="✅ Wczytaj listę",
+            text="Wczytaj listę",
             command=self.load_excel,
             variant="primary"
         )
@@ -975,7 +1231,7 @@ class BatchProcessorApp(tk.Tk):
         
         # Sekcja firmware
         firmware_frame = tk.LabelFrame(batch_frame, 
-                                       text="  🔧 Plik Firmware (opcjonalnie dla aktualizacji)  ", 
+                                       text="  Plik Firmware (opcjonalnie dla aktualizacji)  ", 
                                        padx=15, pady=12,
                                        font=('Segoe UI', 11, 'bold'),
                                        fg="#1E293B",
@@ -986,7 +1242,7 @@ class BatchProcessorApp(tk.Tk):
         
         self.create_action_button(
             firmware_frame,
-            text="📂 Wybierz firmware",
+            text="Wybierz firmware",
             command=self.select_firmware,
             variant="neutral"
         ).pack(side="left", padx=5)
@@ -1010,7 +1266,7 @@ class BatchProcessorApp(tk.Tk):
         """
         # Przyciski akcji - ODCZYT
         read_frame = tk.LabelFrame(batch_frame, 
-                                  text="  📖 Odczyt danych  ", 
+                                  text="  Odczyt danych  ", 
                                   padx=15, pady=10,
                                   font=('Segoe UI', 11, 'bold'),
                                   fg="#1E293B",
@@ -1020,7 +1276,7 @@ class BatchProcessorApp(tk.Tk):
         read_frame.pack(fill="x", padx=12, pady=8)
         self.batch_read_btn = self.create_action_button(
             read_frame,
-            text="🔍 Odczytaj wszystkie sterowniki",
+            text="Odczytaj wszystkie sterowniki",
             command=self.batch_read_all,
             variant="success"
         )
@@ -1028,7 +1284,7 @@ class BatchProcessorApp(tk.Tk):
 
         # Przyciski akcji - AKTUALIZACJE (osobne)
         update_frame = tk.LabelFrame(batch_frame, 
-                                    text="  ⚙️ Aktualizacje (wykonywane osobno)  ", 
+                                    text="  Aktualizacje (wykonywane osobno)  ", 
                                     padx=15, pady=10,
                                     font=('Segoe UI', 11, 'bold'),
                                     fg="#1E293B",
@@ -1042,7 +1298,7 @@ class BatchProcessorApp(tk.Tk):
         
         self.batch_sys_btn = self.create_action_button(
             btn_grid,
-            text="📦 Wyślij System Services (wszystkie)",
+            text="Wyślij System Services (wszystkie)",
             command=self.batch_system_services,
             variant="info"
         )
@@ -1050,7 +1306,7 @@ class BatchProcessorApp(tk.Tk):
 
         self.batch_tz_btn = self.create_action_button(
             btn_grid,
-            text="🕐 Ustaw strefę czasową (wszystkie)",
+            text="Ustaw strefę czasową (wszystkie)",
             command=self.batch_timezone,
             variant="warning"
         )
@@ -1058,7 +1314,7 @@ class BatchProcessorApp(tk.Tk):
 
         self.batch_fw_btn = self.create_action_button(
             btn_grid,
-            text="🔄 Aktualizuj Firmware (wszystkie)",
+            text="Aktualizuj Firmware (wszystkie)",
             command=self.batch_firmware_only,
             variant="primary"
         )
@@ -1066,7 +1322,7 @@ class BatchProcessorApp(tk.Tk):
 
         self.batch_all_btn = self.create_action_button(
             btn_grid,
-            text="⚡ WYKONAJ WSZYSTKO NARAZ",
+            text="WYKONAJ WSZYSTKO NARAZ",
             command=self.batch_update_all,
             variant="accent"
         )
@@ -1076,7 +1332,7 @@ class BatchProcessorApp(tk.Tk):
         btn_grid.columnconfigure(1, weight=1)
         
         progress_frame = tk.LabelFrame(batch_frame, 
-                                       text="  📤 Status transferu plików  ", 
+                                       text="  Status transferu plików  ", 
                                        padx=15, pady=10,
                                        font=('Segoe UI', 11, 'bold'),
                                        fg="#1E293B",
@@ -1106,7 +1362,7 @@ class BatchProcessorApp(tk.Tk):
         self.upload_status_label.pack(padx=5, pady=4)
 
         batch_progress_frame = tk.LabelFrame(batch_frame, 
-                                            text="  📊 Postęp operacji wsadowej  ", 
+                                            text="  Postęp operacji wsadowej  ", 
                                             padx=15, pady=10,
                                             font=('Segoe UI', 11, 'bold'),
                                             fg="#1E293B",
@@ -1139,7 +1395,7 @@ class BatchProcessorApp(tk.Tk):
 
         self.save_excel_btn = self.create_action_button(
             control_frame,
-            text="💾 Zapisz raport Excel",
+            text="Zapisz raport Excel",
             command=self.save_excel,
             variant="primary"
         )
@@ -1147,7 +1403,7 @@ class BatchProcessorApp(tk.Tk):
 
         self.stop_btn = self.create_action_button(
             control_frame,
-            text="⏹️ STOP",
+            text="STOP",
             command=self.stop_processing,
             variant="danger",
             state="disabled"
@@ -1158,7 +1414,7 @@ class BatchProcessorApp(tk.Tk):
         filter_frame.pack(fill="x", padx=12, pady=(0, 5))
         tk.Checkbutton(
             filter_frame,
-            text="🔍 Pokaż tylko sterowniki z problemami",
+            text="Pokaż tylko sterowniki z problemami",
             variable=self.show_errors_only,
             command=self.refresh_device_tree,
             font=('Segoe UI', 10),
@@ -1171,7 +1427,7 @@ class BatchProcessorApp(tk.Tk):
         
         # Tabela ze sterownikami
         table_frame = tk.LabelFrame(batch_frame, 
-                                   text="  📋 Lista sterowników  ", 
+                                   text="  Lista sterowników  ", 
                                    padx=10, pady=10,
                                    font=('Segoe UI', 11, 'bold'),
                                    fg="#1E293B",
@@ -1228,7 +1484,7 @@ class BatchProcessorApp(tk.Tk):
 
         # ZAKŁADKA 2: Logi
         log_frame = tk.Frame(notebook, bg="#F8FAFC")
-        notebook.add(log_frame, text="📄 Logi operacji")
+        notebook.add(log_frame, text="Logi operacji")
 
         self.log_text = scrolledtext.ScrolledText(log_frame, 
                                                    wrap=tk.WORD, 
@@ -1242,19 +1498,24 @@ class BatchProcessorApp(tk.Tk):
 
         self.create_action_button(
             log_frame,
-            text="🗑️ Wyczyść logi",
+            text="Wyczysc logi",
             command=self.clear_logs,
             variant="neutral"
         ).pack(pady=8)
 
-        # ZAKŁADKA 3: Ręczna obsługa (poprawiona)
+        # ZAKŁADKA 3: Konfiguracja
+        config_frame = tk.Frame(notebook, bg="#F8FAFC")
+        notebook.add(config_frame, text="Konfiguracja")
+        self.create_config_interface(config_frame)
+
+        # ZAKŁADKA 4: Ręczna obsługa (poprawiona)
         manual_frame = tk.Frame(notebook, bg="#F8FAFC")
-        notebook.add(manual_frame, text="🔧 Ręczna obsługa")
+        notebook.add(manual_frame, text="Reczna obsluga")
         self.create_manual_interface(manual_frame)
 
         # Status bar
         self.status_bar = tk.Label(self, 
-                                   text="✅ Gotowy", 
+                                   text="Gotowy", 
                                    relief="flat", 
                                    anchor="w", 
                                    bg="#E2E8F0",
@@ -1297,7 +1558,7 @@ class BatchProcessorApp(tk.Tk):
             return True
         if device.timezone and device.timezone.strip() != TIMEZONE.strip():
             return True
-        if device.status == "✗ Błąd":
+        if device.status == "Błąd":
             return True
         return False
 
@@ -1308,28 +1569,28 @@ class BatchProcessorApp(tk.Tk):
 
         plc_time_display = device.plc_time
         if device.time_sync_error:
-            plc_time_display = f"❌ {device.plc_time}"
+            plc_time_display = f"BŁĄD: {device.plc_time}"
             issues.append("Desynchronizacja czasu")
             has_issues = True
 
         sys_services_display = device.system_services_ok
         if device.system_services_ok not in ["OK", ""]:
-            sys_services_display = f"❌ {device.system_services_ok}"
+            sys_services_display = f"BŁĄD: {device.system_services_ok}"
             issues.append("System Services")
             has_issues = True
 
         timezone_display = device.timezone
         if device.timezone and device.timezone.strip() != TIMEZONE.strip():
-            timezone_display = f"❌ {device.timezone}"
+            timezone_display = f"BŁĄD: {device.timezone}"
             issues.append(f"Strefa czasowa ({device.timezone} ≠ {TIMEZONE})")
             has_issues = True
 
-        if device.status == "W trakcie...":
+        if device.status == "W trakcie":
             issues_text = "Sprawdzanie..."
         elif issues:
             issues_text = "\n".join(issues)
         else:
-            issues_text = "✅ Brak"
+            issues_text = "Brak"
 
         values = (
             device.ip,
@@ -1345,9 +1606,9 @@ class BatchProcessorApp(tk.Tk):
 
         if has_issues:
             tags = ('has_issues',)
-        elif device.status == "✓ OK":
+        elif device.status == "OK":
             tags = ('success',)
-        elif device.status == "✗ Błąd":
+        elif device.status == "Błąd":
             tags = ('error',)
         else:
             tags = ()
@@ -1366,11 +1627,244 @@ class BatchProcessorApp(tk.Tk):
             values, tags = self.get_device_row_render_data(device)
             self.device_tree.insert("", "end", text=device.name, values=values, tags=tags)
 
+    def create_config_interface(self, parent):
+        """Tworzy interfejs konfiguracji z edytowalnymi parametrami."""
+        
+        # Kontener główny z scrollem
+        canvas = tk.Canvas(parent, bg="#F8FAFC", highlightthickness=0)
+        scrollbar = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="#F8FAFC")
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # SSH Settings
+        ssh_frame = tk.LabelFrame(scrollable_frame,
+                                 text="  SSH Settings  ",
+                                 padx=20, pady=15,
+                                 font=('Segoe UI', 11, 'bold'),
+                                 fg="#1E293B",
+                                 bg="#F8FAFC",
+                                 relief="solid",
+                                 borderwidth=1)
+        ssh_frame.pack(fill="x", padx=15, pady=10)
+        
+        # SSH Timeout
+        tk.Label(ssh_frame, text="Connection Timeout:", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=0, column=0, sticky="w", pady=5)
+        self.ssh_timeout_var = tk.IntVar(value=self.ssh_timeout)
+        tk.Spinbox(ssh_frame, from_=10, to=120, textvariable=self.ssh_timeout_var,
+                  width=10, font=('Segoe UI', 10)).grid(row=0, column=1, padx=10, pady=5)
+        tk.Label(ssh_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=0, column=2, sticky="w")
+        
+        # SSH Keepalive
+        tk.Label(ssh_frame, text="Keepalive Interval:", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=1, column=0, sticky="w", pady=5)
+        self.ssh_keepalive_var = tk.IntVar(value=self.ssh_keepalive)
+        tk.Spinbox(ssh_frame, from_=10, to=120, textvariable=self.ssh_keepalive_var,
+                  width=10, font=('Segoe UI', 10)).grid(row=1, column=1, padx=10, pady=5)
+        tk.Label(ssh_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=1, column=2, sticky="w")
+        
+        # Retry Settings
+        retry_frame = tk.LabelFrame(scrollable_frame,
+                                   text="  Retry Settings  ",
+                                   padx=20, pady=15,
+                                   font=('Segoe UI', 11, 'bold'),
+                                   fg="#1E293B",
+                                   bg="#F8FAFC",
+                                   relief="solid",
+                                   borderwidth=1)
+        retry_frame.pack(fill="x", padx=15, pady=10)
+        
+        # Retry Attempts
+        tk.Label(retry_frame, text="Retry Attempts:", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=0, column=0, sticky="w", pady=5)
+        self.retry_attempts_var = tk.IntVar(value=self.retry_attempts)
+        tk.Spinbox(retry_frame, from_=1, to=10, textvariable=self.retry_attempts_var,
+                  width=10, font=('Segoe UI', 10)).grid(row=0, column=1, padx=10, pady=5)
+        tk.Label(retry_frame, text="razy", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=0, column=2, sticky="w")
+        
+        # Retry Delay
+        tk.Label(retry_frame, text="Retry Delay:", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=1, column=0, sticky="w", pady=5)
+        self.retry_delay_var = tk.IntVar(value=self.retry_delay)
+        tk.Spinbox(retry_frame, from_=5, to=60, textvariable=self.retry_delay_var,
+                  width=10, font=('Segoe UI', 10)).grid(row=1, column=1, padx=10, pady=5)
+        tk.Label(retry_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=1, column=2, sticky="w")
+        
+        # Transfer Settings
+        transfer_frame = tk.LabelFrame(scrollable_frame,
+                                      text="  Transfer Settings  ",
+                                      padx=20, pady=15,
+                                      font=('Segoe UI', 11, 'bold'),
+                                      fg="#1E293B",
+                                      bg="#F8FAFC",
+                                      relief="solid",
+                                      borderwidth=1)
+        transfer_frame.pack(fill="x", padx=15, pady=10)
+        
+        # Pause Between Devices
+        tk.Label(transfer_frame, text="Pause Between Devices:", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=0, column=0, sticky="w", pady=5)
+        self.pause_between_var = tk.IntVar(value=self.pause_between_devices)
+        tk.Spinbox(transfer_frame, from_=0, to=30, textvariable=self.pause_between_var,
+                  width=10, font=('Segoe UI', 10)).grid(row=0, column=1, padx=10, pady=5)
+        tk.Label(transfer_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=0, column=2, sticky="w")
+        
+        # Upload Timeout
+        tk.Label(transfer_frame, text="Upload Timeout (firmware):", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=1, column=0, sticky="w", pady=5)
+        self.upload_timeout_var = tk.IntVar(value=self.upload_timeout)
+        tk.Spinbox(transfer_frame, from_=300, to=3600, increment=300, textvariable=self.upload_timeout_var,
+                  width=10, font=('Segoe UI', 10)).grid(row=1, column=1, padx=10, pady=5)
+        tk.Label(transfer_frame, text="s (15min)", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=1, column=2, sticky="w")
+        
+        # Idle Timeout
+        tk.Label(transfer_frame, text="Idle Timeout (no progress):", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=2, column=0, sticky="w", pady=5)
+        self.idle_timeout_var = tk.IntVar(value=self.idle_timeout)
+        tk.Spinbox(transfer_frame, from_=30, to=300, textvariable=self.idle_timeout_var,
+                  width=10, font=('Segoe UI', 10)).grid(row=2, column=1, padx=10, pady=5)
+        tk.Label(transfer_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=2, column=2, sticky="w")
+
+        # Update Command Timeout
+        tk.Label(transfer_frame, text="Update Command Timeout (update-axcf):", 
+            font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=3, column=0, sticky="w", pady=5)
+        self.update_command_timeout_var = tk.IntVar(value=self.update_command_timeout)
+        tk.Spinbox(transfer_frame, from_=300, to=1800, increment=60, textvariable=self.update_command_timeout_var,
+              width=10, font=('Segoe UI', 10)).grid(row=3, column=1, padx=10, pady=5)
+        tk.Label(transfer_frame, text="s (10min)", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=3, column=2, sticky="w")
+        
+        # Reboot Settings
+        reboot_frame = tk.LabelFrame(scrollable_frame,
+                                    text="  Reboot Settings  ",
+                                    padx=20, pady=15,
+                                    font=('Segoe UI', 11, 'bold'),
+                                    fg="#1E293B",
+                                    bg="#F8FAFC",
+                                    relief="solid",
+                                    borderwidth=1)
+        reboot_frame.pack(fill="x", padx=15, pady=10)
+        
+        # Post Reboot Wait
+        tk.Label(reboot_frame, text="Initial Wait After Reboot:", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=0, column=0, sticky="w", pady=5)
+        self.post_reboot_wait_var = tk.IntVar(value=self.post_reboot_wait)
+        tk.Spinbox(reboot_frame, from_=30, to=180, textvariable=self.post_reboot_wait_var,
+                  width=10, font=('Segoe UI', 10)).grid(row=0, column=1, padx=10, pady=5)
+        tk.Label(reboot_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=0, column=2, sticky="w")
+        
+        # Post Reboot Timeout
+        tk.Label(reboot_frame, text="Reconnect Global Timeout:", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=1, column=0, sticky="w", pady=5)
+        self.post_reboot_timeout_var = tk.IntVar(value=self.post_reboot_timeout)
+        tk.Spinbox(reboot_frame, from_=120, to=600, textvariable=self.post_reboot_timeout_var,
+                  width=10, font=('Segoe UI', 10)).grid(row=1, column=1, padx=10, pady=5)
+        tk.Label(reboot_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=1, column=2, sticky="w")
+        
+        # Post Reboot Poll
+        tk.Label(reboot_frame, text="Poll Interval:", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=2, column=0, sticky="w", pady=5)
+        self.post_reboot_poll_var = tk.IntVar(value=self.post_reboot_poll)
+        tk.Spinbox(reboot_frame, from_=3, to=30, textvariable=self.post_reboot_poll_var,
+                  width=10, font=('Segoe UI', 10)).grid(row=2, column=1, padx=10, pady=5)
+        tk.Label(reboot_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=2, column=2, sticky="w")
+        
+        # Parallel Processing
+        parallel_frame = tk.LabelFrame(scrollable_frame,
+                          text="  Parallel Processing  ",
+                                      padx=20, pady=15,
+                                      font=('Segoe UI', 11, 'bold'),
+                                      fg="#1E293B",
+                                      bg="#F8FAFC",
+                                      relief="solid",
+                                      borderwidth=1)
+        parallel_frame.pack(fill="x", padx=15, pady=10)
+        
+        tk.Label(parallel_frame, text="Parallel PLC workers:", 
+                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=0, column=0, sticky="w", pady=5)
+        self.parallel_workers_var = tk.IntVar(value=self.parallel_workers)
+        tk.Spinbox(parallel_frame, from_=1, to=5, textvariable=self.parallel_workers_var,
+              width=10, font=('Segoe UI', 10)).grid(row=0, column=1, padx=10, pady=5, sticky="w")
+        tk.Label(parallel_frame, text="(1-5)", 
+            font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=0, column=2, sticky="w")
+        
+        # Przyciski
+        button_frame = tk.Frame(scrollable_frame, bg="#F8FAFC")
+        button_frame.pack(fill="x", padx=15, pady=20)
+        
+        self.create_action_button(
+            button_frame,
+            text="Zastosuj zmiany",
+            command=self.apply_config,
+            variant="primary"
+        ).pack(side="left", padx=5, fill="x", expand=True)
+        
+        self.create_action_button(
+            button_frame,
+            text="Przywroc domyslne",
+            command=self.reset_config,
+            variant="neutral"
+        ).pack(side="left", padx=5, fill="x", expand=True)
+        
+        canvas.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        scrollbar.pack(side="right", fill="y")
+
+    def apply_config(self):
+        """Zastosuj zmiany z zakładki konfiguracji."""
+        self.ssh_timeout = self.ssh_timeout_var.get()
+        self.ssh_keepalive = self.ssh_keepalive_var.get()
+        self.retry_attempts = self.retry_attempts_var.get()
+        self.retry_delay = self.retry_delay_var.get()
+        self.pause_between_devices = self.pause_between_var.get()
+        self.upload_timeout = self.upload_timeout_var.get()
+        self.update_command_timeout = self.update_command_timeout_var.get()
+        self.idle_timeout = self.idle_timeout_var.get()
+        self.post_reboot_wait = self.post_reboot_wait_var.get()
+        self.post_reboot_timeout = self.post_reboot_timeout_var.get()
+        self.post_reboot_poll = self.post_reboot_poll_var.get()
+        self.parallel_workers = self.parallel_workers_var.get()
+        
+        self.log("Zastosowano nowe ustawienia konfiguracji")
+        messagebox.showinfo("Sukces", "Ustawienia zostaly zaktualizowane")
+
+    def reset_config(self):
+        """Przywróć domyślne wartości konfiguracji."""
+        self.ssh_timeout_var.set(DEFAULT_SSH_TIMEOUT)
+        self.ssh_keepalive_var.set(DEFAULT_SSH_KEEPALIVE)
+        self.retry_attempts_var.set(DEFAULT_RETRY_ATTEMPTS)
+        self.retry_delay_var.set(DEFAULT_RETRY_DELAY)
+        self.pause_between_var.set(DEFAULT_PAUSE_BETWEEN)
+        self.upload_timeout_var.set(DEFAULT_UPLOAD_TIMEOUT)
+        self.update_command_timeout_var.set(DEFAULT_UPDATE_COMMAND_TIMEOUT)
+        self.idle_timeout_var.set(DEFAULT_IDLE_TIMEOUT)
+        self.post_reboot_wait_var.set(DEFAULT_POST_REBOOT_WAIT)
+        self.post_reboot_timeout_var.set(DEFAULT_POST_REBOOT_TIMEOUT)
+        self.post_reboot_poll_var.set(DEFAULT_POST_REBOOT_POLL)
+        self.parallel_workers_var.set(DEFAULT_PARALLEL_WORKERS)
+        
+        self.apply_config()
+        self.log("Przywrocono domyslne ustawienia")
+
+    def _clean_ip_field(self, entry_widget):
+        """Czyści pole IP z niepotrzebnych znaków."""
+        current_value = entry_widget.get()
+        cleaned = clean_ip_address(current_value)
+        if cleaned != current_value:
+            entry_widget.delete(0, tk.END)
+            entry_widget.insert(0, cleaned)
+            self.log(f"Oczyszczono IP: '{current_value}' -> '{cleaned}'")
+
     def create_manual_interface(self, parent):
         """Tworzy nowoczesny interfejs do ręcznej obsługi pojedynczego sterownika."""
         
         connection_frame = tk.LabelFrame(parent, 
-                                        text="  🔌 Połączenie  ", 
+                                        text="  Połączenie  ", 
                                         padx=15, pady=15,
                                         font=('Segoe UI', 11, 'bold'),
                                         fg="#1E293B",
@@ -1390,6 +1884,15 @@ class BatchProcessorApp(tk.Tk):
                                 relief="solid",
                                 borderwidth=1)
         self.ip_entry.pack(pady=(0,10))
+        
+        # Auto-czyszczenie IP przy wklejaniu (Ctrl+V lub paste)
+        def on_ip_paste(event):
+            # Dodaj opóźnienie aby pozwolić na wklejenie
+            self.after(50, lambda: self._clean_ip_field(self.ip_entry))
+        
+        self.ip_entry.bind('<Control-v>', on_ip_paste)
+        self.ip_entry.bind('<Button-3>', on_ip_paste)  # prawy klik -> paste
+        self.ip_entry.bind('<FocusOut>', lambda e: self._clean_ip_field(self.ip_entry))
         
         tk.Label(connection_frame, 
                 text="Hasło:", 
@@ -1434,7 +1937,7 @@ class BatchProcessorApp(tk.Tk):
         
         self.create_action_button(
             connection_frame,
-            text="🔍 Odczytaj dane z PLC",
+            text="Odczytaj dane z PLC",
             command=self.manual_read_plc,
             variant="primary"
         ).pack(pady=10)
@@ -1454,7 +1957,7 @@ class BatchProcessorApp(tk.Tk):
         
         # Sekcja operacji ręcznych
         operations_frame = tk.LabelFrame(parent, 
-                                        text="  ⚙️ Operacje pojedyncze  ", 
+                                        text="  Operacje pojedyncze  ", 
                                         padx=15, pady=12,
                                         font=('Segoe UI', 11, 'bold'),
                                         fg="#1E293B",
@@ -1466,7 +1969,7 @@ class BatchProcessorApp(tk.Tk):
         # Strefa czasowa
         self.create_action_button(
             operations_frame,
-            text="🕐 Ustaw strefę czasową",
+            text="Ustaw strefę czasową",
             command=self.manual_set_timezone,
             variant="warning"
         ).pack(fill="x", padx=5, pady=3)
@@ -1474,14 +1977,14 @@ class BatchProcessorApp(tk.Tk):
         # System Services
         self.create_action_button(
             operations_frame,
-            text="⚙️ Wyślij System Services",
+            text="Wyślij System Services",
             command=self.manual_upload_system_services,
             variant="info"
         ).pack(fill="x", padx=5, pady=3)
         
         # Firmware
         firmware_manual_frame = tk.LabelFrame(parent, 
-                                             text="  🔄 Aktualizacja Firmware  ", 
+                                             text="  Aktualizacja Firmware  ", 
                                              padx=15, pady=12,
                                              font=('Segoe UI', 11, 'bold'),
                                              fg="#1E293B",
@@ -1492,7 +1995,7 @@ class BatchProcessorApp(tk.Tk):
         
         self.create_action_button(
             firmware_manual_frame,
-            text="📂 Wybierz plik firmware",
+            text="Wybierz plik firmware",
             command=self.select_manual_firmware,
             variant="neutral"
         ).pack(pady=8)
@@ -1512,13 +2015,13 @@ class BatchProcessorApp(tk.Tk):
         manual_fw_buttons.pack(pady=5)
         self.create_action_button(
             manual_fw_buttons,
-            text="📤 Wyślij firmware",
+            text="Wyślij firmware",
             command=self.manual_upload_firmware,
             variant="success"
         ).pack(side="left", padx=5)
         self.create_action_button(
             manual_fw_buttons,
-            text="🔄 Wykonaj aktualizację",
+            text="Wykonaj aktualizację",
             command=self.manual_execute_update,
             variant="danger"
         ).pack(side="left", padx=5)
@@ -1575,11 +2078,11 @@ class BatchProcessorApp(tk.Tk):
             wb.close()
             self.refresh_device_tree()
             self.update_action_buttons_state()
-            self.log(f"✓ Wczytano {len(self.devices)} sterowników z pliku Excel")
+            self.log(f"Wczytano {len(self.devices)} sterowników z pliku Excel")
             messagebox.showinfo("Sukces", f"Wczytano {len(self.devices)} sterowników")
             
         except Exception as e:
-            self.log(f"✗ Błąd wczytywania Excel: {str(e)}")
+            self.log(f"Błąd wczytywania Excel: {str(e)}")
             messagebox.showerror("Błąd", f"Błąd wczytywania pliku Excel:\n{str(e)}")
 
     def save_excel(self):
@@ -1643,11 +2146,11 @@ class BatchProcessorApp(tk.Tk):
                 ws.column_dimensions[column_letter].width = adjusted_width
             
             wb.save(save_path)
-            self.log(f"✓ Zapisano raport do: {save_path}")
+            self.log(f"Zapisano raport do: {save_path}")
             messagebox.showinfo("Sukces", f"Raport zapisany:\n{save_path}")
             
         except Exception as e:
-            self.log(f"✗ Błąd zapisu Excel: {str(e)}")
+            self.log(f"Błąd zapisu Excel: {str(e)}")
             messagebox.showerror("Błąd", f"Błąd zapisu do Excel:\n{str(e)}")
 
     def update_firmware_only_operation(self, device):
@@ -1655,7 +2158,7 @@ class BatchProcessorApp(tk.Tk):
         Aktualizuje TYLKO firmware (z automatycznym wykrywaniem modelu i walidacją).
         POPRAWIONA: Używa execute_firmware_update() dla bezpiecznego reebootu.
         """
-        self.log(f"📦 Aktualizacja Firmware...")
+        self.log(f"Aktualizacja Firmware...")
         
         firmware_file = self.firmware_path.get()
         
@@ -1664,52 +2167,46 @@ class BatchProcessorApp(tk.Tk):
             self.read_single_device(device)
         except Exception as e:
             error_msg = f"Nie można odczytać danych sterownika przed aktualizacją: {str(e)}"
-            self.log(f"  ❌ {error_msg}")
+            self.log(f"  BŁĄD: {error_msg}")
             raise Exception(error_msg)
         
         # Walidacja kompatybilności
         is_compatible, compat_msg = self.validate_firmware_compatibility(device, firmware_file)
-        self.log(f"  🔍 {compat_msg}")
+        self.log(f"  {compat_msg}")
         
         if not is_compatible:
             raise FatalUpdateError(compat_msg)
         
         # Sprawdź czy firmware jest aktualny
         if self.compare_firmware_versions(device.firmware_version, firmware_file):
-            self.log(f"  ✅ Firmware już aktualny (v.{device.firmware_version}) - pomijam aktualizację")
+            self.log(f"  Firmware już aktualny (v.{device.firmware_version}) - pomijam aktualizację")
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return True
         
         try:
-            # ✅ KROK 1: UPLOAD FIRMWARE (w context managerze)
+            # KROK 1: UPLOAD FIRMWARE (w context managerze)
             with self.ssh_connection(device) as (ssh, sftp):
                 
                 filename = os.path.basename(firmware_file)
                 remote_fw_path = f"/opt/plcnext/{filename}"
                 
                 file_size = os.path.getsize(firmware_file)
-                self.log(f"  📤 Wysyłanie firmware ({file_size/1024/1024:.1f} MB)...")
+                self.log(f"  Wysyłanie firmware ({file_size/1024/1024:.1f} MB)...")
                 
-                sftp.put(
-                    firmware_file, 
+                self.upload_file_with_resume(
+                    sftp,
+                    firmware_file,
                     remote_fw_path,
-                    callback=lambda transferred, total: self.upload_callback(
-                        filename, transferred, total
-                    )
+                    device=device
                 )
                 
                 self.reset_upload_progress()
                 
-                # Weryfikacja rozmiaru
-                remote_size = sftp.stat(remote_fw_path).st_size
-                if remote_size != file_size:
-                    raise Exception(f"Transfer niepełny! Lokalny: {file_size}, Zdalny: {remote_size}")
-                
-                self.log(f"  ✓ Firmware wysłany i zweryfikowany")
+                self.log(f"  Firmware wysłany i zweryfikowany")
             
-            # ✅ Context manager zamknął SSH/SFTP tutaj
+            # Context manager zamknął SSH/SFTP tutaj
             
-            # ✅ KROK 2: WYKONAJ UPDATE (NOWE połączenie SSH)
+            # KROK 2: WYKONAJ UPDATE (NOWE połączenie SSH)
             self.execute_firmware_update(device)
             
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1812,7 +2309,7 @@ class BatchProcessorApp(tk.Tk):
         
         response = messagebox.askyesno(
             "Potwierdzenie",
-            f"🚀 PEŁNA AKTUALIZACJA {len(self.devices)} sterowników:\n\n"
+            f"PEŁNA AKTUALIZACJA {len(self.devices)} sterowników:\n\n"
             "Operacje wykonywane dla każdego sterownika:\n"
             "1. System Services (jeśli potrzebne)\n"
             "2. Firmware - wysłanie i sudo update\n"
@@ -1831,22 +2328,22 @@ class BatchProcessorApp(tk.Tk):
         Wysyła System Services i restartuje sterownik. Pomija, jeśli jest już OK.
         POPRAWIONA: Używa execute_reboot() dla bezpiecznego reebootu.
         """
-        self.log(f"⚙️  Aktualizacja System Services...")
+        self.log(f"Aktualizacja System Services...")
         
         # Sprawdzenie statusu przed operacją
         try:
             self.read_single_device(device)
         except Exception as e:
-            self.log(f"  ⚠️  Błąd odczytu przed aktualizacją SysServices: {str(e)}")
+            self.log(f"  UWAGA: Błąd odczytu przed aktualizacją SysServices: {str(e)}")
         
         # Logika pominięcia
         if device.system_services_ok == "OK":
-            self.log(f"  ℹ️  System Services już aktualne - pomijam")
+            self.log(f"  INFO: System Services już aktualne - pomijam")
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return True
         
         try:
-            # ✅ KROK 1: UPLOAD SYSTEM SERVICES (w context managerze)
+            # KROK 1: UPLOAD SYSTEM SERVICES (w context managerze)
             with self.ssh_connection(device) as (ssh, sftp):
                 
                 local_sys_file = resource_path(SYSTEM_SERVICES_FILE)
@@ -1857,29 +2354,23 @@ class BatchProcessorApp(tk.Tk):
                 filename = os.path.basename(local_sys_file)
                 file_size = os.path.getsize(local_sys_file)
                 
-                self.log(f"  📤 Wysyłanie {filename} ({file_size/1024:.1f} KB)...")
+                self.log(f"  Wysyłanie {filename} ({file_size/1024:.1f} KB)...")
                 
-                sftp.put(
-                    local_sys_file, 
+                self.upload_file_with_resume(
+                    sftp,
+                    local_sys_file,
                     remote_sys_path,
-                    callback=lambda transferred, total: self.upload_callback(
-                        filename, transferred, total
-                    )
+                    device=device
                 )
                 
                 self.reset_upload_progress()
                 
-                # Weryfikacja
-                remote_size = sftp.stat(remote_sys_path).st_size
-                if file_size != remote_size:
-                    raise Exception(f"Transfer niepełny! Lokalny: {file_size}, Zdalny: {remote_size}")
-                
                 device.system_services_ok = "OK"
-                self.log(f"  ✓ System Services wysłane i zweryfikowane")
+                self.log(f"  System Services wysłane i zweryfikowane")
             
-            # ✅ Context manager zamknął SSH/SFTP tutaj
+            # Context manager zamknął SSH/SFTP tutaj
             
-            # ✅ KROK 2: REBOOT (NOWE połączenie SSH)
+            # KROK 2: REBOOT (NOWE połączenie SSH)
             self.execute_reboot(device)
             
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1895,25 +2386,25 @@ class BatchProcessorApp(tk.Tk):
         Ustawia strefę czasową i restartuje. Pomija, jeśli już OK.
         POPRAWIONA: Używa execute_reboot() dla bezpiecznego reebootu.
         """
-        self.log(f"🕐 Aktualizacja strefy czasowej na {TIMEZONE}...")
+        self.log(f"Aktualizacja strefy czasowej na {TIMEZONE}...")
         
         # Sprawdzenie statusu przed operacją
         try:
             self.read_single_device(device)
         except Exception as e:
-            self.log(f"  ⚠️  Błąd odczytu przed aktualizacją Timezone: {str(e)}")
+            self.log(f"  UWAGA: Błąd odczytu przed aktualizacją Timezone: {str(e)}")
         
         # Logika pominięcia
         if device.timezone.strip() == TIMEZONE.strip():
-            self.log(f"  ℹ️  Strefa czasowa już ustawiona na {TIMEZONE} - pomijam")
+            self.log(f"  INFO: Strefa czasowa już ustawiona na {TIMEZONE} - pomijam")
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return True
         
         try:
-            # ✅ KROK 1: USTAWIENIE TIMEZONE (w context managerze)
+            # KROK 1: USTAWIENIE TIMEZONE (w context managerze)
             with self.ssh_connection(device) as (ssh, sftp):
                 
-                self.log(f"  📝 Ustawianie strefy czasowej na {TIMEZONE}...")
+                self.log(f"  Ustawianie strefy czasowej na {TIMEZONE}...")
                 
                 # Wpisanie TIMEZONE do /etc/timezone
                 stdin, stdout, stderr = ssh.exec_command(
@@ -1934,11 +2425,11 @@ class BatchProcessorApp(tk.Tk):
                 time.sleep(1)
                 
                 device.timezone = TIMEZONE
-                self.log("  ✓ Strefa czasowa ustawiona")
+                self.log("  Strefa czasowa ustawiona")
             
-            # ✅ Context manager zamknął SSH/SFTP tutaj
+            # Context manager zamknął SSH/SFTP tutaj
             
-            # ✅ KROK 2: REBOOT (NOWE połączenie SSH)
+            # KROK 2: REBOOT (NOWE połączenie SSH)
             self.execute_reboot(device)
             
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1962,7 +2453,7 @@ class BatchProcessorApp(tk.Tk):
         7. ZAMKNIĘCIE SFTP przed rebootem/update
         8. Wykonanie sudo update / sudo reboot (tylko jeśli FW lub SS było wgrywane)
         """
-        self.log(f"🚀 PEŁNA AKTUALIZACJA: START")
+        self.log(f"PEŁNA AKTUALIZACJA: START")
         
         firmware_file = self.firmware_path.get()
         
@@ -1972,30 +2463,30 @@ class BatchProcessorApp(tk.Tk):
         tz_updated = False
         
         try:
-            # ✅ UŻYJ CONTEXT MANAGERA dla bezpiecznego SSH/SFTP
+            # UŻYJ CONTEXT MANAGERA dla bezpiecznego SSH/SFTP
             with self.ssh_connection(device) as (ssh, sftp):
                 
                 # 1. Wykryj model PLC
                 device.plc_model = self.detect_plc_model(ssh)
                 
                 if not device.plc_model:
-                    raise Exception("❌ Nie można wykryć modelu sterownika!")
+                    raise Exception("Nie można wykryć modelu sterownika!")
                 
                 # 2. Walidacja kompatybilności firmware
                 is_compatible, compat_msg = self.validate_firmware_compatibility(device, firmware_file)
-                self.log(f"  🔍 {compat_msg}")
+                self.log(f"  {compat_msg}")
                 
                 if not is_compatible:
-                    raise FatalUpdateError(f"❌ {compat_msg}\n\n⚠️ ZATRZYMANO AKTUALIZACJĘ!")
+                    raise FatalUpdateError(f"{compat_msg}\n\nZATRZYMANO AKTUALIZACJĘ!")
                 
                 # 3. Odczyt wstępny danych
-                self.log("  📖 Wstępny odczyt danych...")
+                self.log("  Wstępny odczyt danych...")
                 
                 # Firmware version
                 stdin, stdout, stderr = ssh.exec_command("grep Arpversion /etc/plcnext/arpversion")
                 fw_output = stdout.read().decode().strip()
                 
-                self.log(f"  🔍 Surowy output wersji firmware: '{fw_output}'")
+                self.log(f"  Surowy output wersji firmware: '{fw_output}'")
                 
                 version_string = "?"
                 if fw_output:
@@ -2009,13 +2500,13 @@ class BatchProcessorApp(tk.Tk):
                     else:
                         version_string = fw_output.strip()
                     
-                    self.log(f"  🔍 Sparsowana wersja: '{version_string}'")
+                    self.log(f"  Sparsowana wersja: '{version_string}'")
                 
                 if version_string and version_string != "?" and version_string[0].isdigit():
                     device.firmware_version = version_string
                 else:
                     device.firmware_version = "?"
-                    self.log(f"  ⚠️ Nie można odczytać poprawnej wersji firmware!")
+                    self.log(f"  UWAGA: Nie można odczytać poprawnej wersji firmware!")
                 
                 # Timezone
                 stdin, stdout, stderr = ssh.exec_command("cat /etc/timezone")
@@ -2031,22 +2522,22 @@ class BatchProcessorApp(tk.Tk):
                         remote_size = remote_stat.st_size
                         device.system_services_ok = "OK" if local_size == remote_size else "Różnica"
                         if device.system_services_ok == "Różnica":
-                            self.log(f"  ⚠️ System Services - różnica rozmiaru: lokalny={local_size}, zdalny={remote_size}")
+                            self.log(f"  UWAGA: System Services - różnica rozmiaru: lokalny={local_size}, zdalny={remote_size}")
                     else:
                         device.system_services_ok = "Istnieje"
                 except FileNotFoundError:
                     device.system_services_ok = "Brak"
                 except Exception as e:
                     device.system_services_ok = "Błąd"
-                    self.log(f"  ⚠️ Błąd sprawdzania System Services: {str(e)}")
+                    self.log(f"  UWAGA: Błąd sprawdzania System Services: {str(e)}")
                 
-                self.log(f"  ⚙️ Status System Services: {device.system_services_ok}")
-                self.log(f"  📦 Aktualna wersja FW: {device.firmware_version}")
-                self.log(f"  🕐 Aktualna strefa czasowa: {device.timezone}")
+                self.log(f"  Status System Services: {device.system_services_ok}")
+                self.log(f"  Aktualna wersja FW: {device.firmware_version}")
+                self.log(f"  Aktualna strefa czasowa: {device.timezone}")
                 
                 # 4. System Services - TYLKO UPLOAD, REBOOT PÓŹNIEJ
                 if device.system_services_ok != "OK":
-                    self.log(f"  ⚙️ System Services: {device.system_services_ok}. Wymagana aktualizacja.")
+                    self.log(f"  System Services: {device.system_services_ok}. Wymagana aktualizacja.")
                     
                     local_sys_file = resource_path(SYSTEM_SERVICES_FILE)
                     if not os.path.exists(local_sys_file):
@@ -2055,62 +2546,49 @@ class BatchProcessorApp(tk.Tk):
                     remote_sys_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
                     filename = os.path.basename(local_sys_file)
                     
-                    self.log(f"  📤 Wysyłanie {filename}...")
+                    self.log(f"  Wysyłanie {filename}...")
                     
-                    sftp.put(
-                        local_sys_file, 
+                    self.upload_file_with_resume(
+                        sftp,
+                        local_sys_file,
                         remote_sys_path,
-                        callback=lambda transferred, total: self.upload_callback(
-                            filename, transferred, total
-                        )
+                        device=device
                     )
-                    
-                    # Weryfikacja
-                    remote_size = sftp.stat(remote_sys_path).st_size
-                    local_size = os.path.getsize(local_sys_file)
-                    if remote_size != local_size:
-                        raise Exception(f"Transfer SS niepełny! Lokalny: {local_size}, Zdalny: {remote_size}")
                     
                     self.reset_upload_progress()
                     device.system_services_ok = "OK"
                     ss_updated = True
-                    self.log(f"  ✓ System Services wysłane i zweryfikowane")
+                    self.log(f"  System Services wysłane i zweryfikowane")
                 else:
-                    self.log("  ⚙️ System Services OK - pomijam wysyłkę")
+                    self.log("  System Services OK - pomijam wysyłkę")
                 
                 # 5. Firmware - TYLKO UPLOAD, UPDATE PÓŹNIEJ
                 if not self.compare_firmware_versions(device.firmware_version, firmware_file):
                     fw_needed = True
                     target_fw_version = self.get_target_fw_version(firmware_file)
-                    self.log(f"  📦 Firmware nieaktualne. Aktualna: {device.firmware_version}, Docelowa: {target_fw_version}")
+                    self.log(f"  Firmware nieaktualne. Aktualna: {device.firmware_version}, Docelowa: {target_fw_version}")
                     
-                    self.log("  📤 Wysyłanie Firmware...")
+                    self.log("  Wysyłanie Firmware...")
                     filename = os.path.basename(firmware_file)
                     remote_fw_path = f"/opt/plcnext/{filename}"
                     
                     file_size = os.path.getsize(firmware_file)
                     
-                    sftp.put(
-                        firmware_file, 
+                    self.upload_file_with_resume(
+                        sftp,
+                        firmware_file,
                         remote_fw_path,
-                        callback=lambda transferred, total: self.upload_callback(
-                            filename, transferred, total
-                        )
+                        device=device
                     )
                     
-                    # Weryfikacja
-                    remote_size = sftp.stat(remote_fw_path).st_size
-                    if remote_size != file_size:
-                        raise Exception(f"Transfer FW niepełny! Lokalny: {file_size}, Zdalny: {remote_size}")
-                    
                     self.reset_upload_progress()
-                    self.log(f"  ✓ Plik firmware wysłany i zweryfikowany ({file_size/1024/1024:.1f} MB)")
+                    self.log(f"  Plik firmware wysłany i zweryfikowany ({file_size/1024/1024:.1f} MB)")
                 else:
-                    self.log(f"  ✅ Firmware (v.{device.firmware_version}) jest aktualne - pomijam wysyłkę")
+                    self.log(f"  Firmware (v.{device.firmware_version}) jest aktualne - pomijam wysyłkę")
 
                 # 6. Timezone - TYLKO USTAWIENIE, REBOOT PÓŹNIEJ
                 if device.timezone.strip() != TIMEZONE.strip():
-                    self.log(f"  🕐 Strefa czasowa niepoprawna. Ustawianie na {TIMEZONE}...")
+                    self.log(f"  Strefa czasowa niepoprawna. Ustawianie na {TIMEZONE}...")
                     
                     stdin, stdout, stderr = ssh.exec_command(
                         f"sudo sh -c 'echo {TIMEZONE} > /etc/timezone'", 
@@ -2130,11 +2608,11 @@ class BatchProcessorApp(tk.Tk):
                     
                     device.timezone = TIMEZONE
                     tz_updated = True
-                    self.log("  ✓ Strefa czasowa ustawiona")
+                    self.log("  Strefa czasowa ustawiona")
                 else:
-                    self.log("  🕐 Strefa czasowa OK - pomijam zmianę")
+                    self.log("  Strefa czasowa OK - pomijam zmianę")
                 
-                self.log("  ✓ Wszystkie transfery zakończone")
+                self.log("  Wszystkie transfery zakończone")
             
             # Context manager zamknął SSH tutaj - wszystkie transfery zakończone!
             
@@ -2142,7 +2620,7 @@ class BatchProcessorApp(tk.Tk):
             needs_reboot = ss_updated or tz_updated
             
             if fw_needed or needs_reboot:
-                self.log("  🔄 WYKONYWANIE AKTUALIZACJI / RESTART...")
+                self.log("  WYKONYWANIE AKTUALIZACJI / RESTART...")
                 
                 if fw_needed:
                     # Firmware update - to robi automatyczny reboot
@@ -2152,7 +2630,7 @@ class BatchProcessorApp(tk.Tk):
                     # Tylko reboot (SS lub TZ się zmieniły, ale nie FW)
                     self.execute_reboot(device)
             else:
-                self.log("  ℹ️ Wszystkie komponenty aktualne. Pomijam restart")
+                self.log("  INFO: Wszystkie komponenty aktualne. Pomijam restart")
 
             device.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return True
@@ -2202,7 +2680,7 @@ class BatchProcessorApp(tk.Tk):
         """Zatrzymuje przetwarzanie."""
         if messagebox.askyesno("Potwierdzenie", "Czy na pewno chcesz zatrzymać operację?"):
             self.processing = False
-            self.log("⏹️  Żądanie zatrzymania operacji...")
+            self.log("Żądanie zatrzymania operacji...")
 
     def log(self, message):
         """Dodaje wiadomość do kolejki logów."""
@@ -2256,12 +2734,12 @@ class BatchProcessorApp(tk.Tk):
             
             self.manual_data_label.config(text=display_text)
             self.status_bar.config(text="Gotowy")
-            self.log(f"✓ Odczytano dane z {device.ip}")
+            self.log(f"Odczytano dane z {device.ip}")
             
         except Exception as e:
             self.status_bar.config(text="Błąd")
             self.manual_data_label.config(text=f"Błąd odczytu:\n{str(e)}")
-            self.log(f"✗ Błąd odczytu z {device.ip}: {str(e)}")
+            self.log(f"Błąd odczytu z {device.ip}: {str(e)}")
             messagebox.showerror("Błąd", f"Błąd odczytu:\n{str(e)}")
 
     def select_manual_firmware(self):
@@ -2304,7 +2782,7 @@ class BatchProcessorApp(tk.Tk):
             
         except Exception as e:
             self.status_bar.config(text="Błąd")
-            self.log(f"✗ Błąd ustawiania strefy czasowej: {str(e)}")
+            self.log(f"Błąd ustawiania strefy czasowej: {str(e)}")
             self.after(0, lambda: messagebox.showerror("Błąd", f"Błąd:\n{str(e)}"))
 
     def manual_upload_system_services(self):
@@ -2346,7 +2824,7 @@ class BatchProcessorApp(tk.Tk):
             
         except Exception as e:
             self.status_bar.config(text="Błąd")
-            self.log(f"✗ Błąd wysyłania System Services: {str(e)}")
+            self.log(f"Błąd wysyłania System Services: {str(e)}")
             self.after(0, lambda: messagebox.showerror("Błąd", f"Błąd:\n{str(e)}"))
 
     def manual_upload_firmware(self):
@@ -2374,13 +2852,11 @@ class BatchProcessorApp(tk.Tk):
             self.status_bar.config(text="Wysyłanie firmware...")
             self.log(f"Łączenie z {ip} - wysyłanie firmware...")
             
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(ip, username=PLC_USER, password=password, timeout=30)
+            ssh = self.create_ssh_client(ip, password)
 
             transport = ssh.get_transport()
             if transport:
-                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
+                transport.set_keepalive(self.ssh_keepalive)
             
             sftp = ssh.open_sftp()
             filename = os.path.basename(firmware_file)
@@ -2389,7 +2865,7 @@ class BatchProcessorApp(tk.Tk):
             file_size = os.path.getsize(firmware_file)
             self.log(f"Wysyłanie {filename} ({file_size/1024/1024:.1f} MB)...")
             
-            sftp.put(firmware_file, remote_path)
+            self.upload_file_with_resume(sftp, firmware_file, remote_path)
             
             # Weryfikacja
             remote_size = sftp.stat(remote_path).st_size
@@ -2400,7 +2876,7 @@ class BatchProcessorApp(tk.Tk):
             
             if remote_size == file_size:
                 self.status_bar.config(text="Gotowy")
-                self.log(f"✓ Firmware przesłane pomyślnie")
+                self.log(f"Firmware przesłane pomyślnie")
                 self.after(0, lambda: messagebox.showinfo(
                     "Sukces",
                     f"Firmware zostało przesłane!\n"
@@ -2419,7 +2895,7 @@ class BatchProcessorApp(tk.Tk):
                 ssh.close()
                 time.sleep(1)
             self.status_bar.config(text="Błąd")
-            self.log(f"✗ Błąd wysyłania firmware: {str(e)}")
+            self.log(f"Błąd wysyłania firmware: {str(e)}")
             self.after(0, lambda: messagebox.showerror("Błąd", f"Błąd:\n{str(e)}"))
 
     def manual_execute_update(self):
@@ -2450,22 +2926,11 @@ class BatchProcessorApp(tk.Tk):
             self.status_bar.config(text="Wykonywanie aktualizacji...")
             self.log(f"Łączenie z {ip} - wykonywanie aktualizacji firmware...")
             
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(
-                ip,
-                username=PLC_USER,
-                password=password,
-                timeout=30,
-                banner_timeout=30,
-                auth_timeout=30,
-                allow_agent=False,
-                look_for_keys=False
-            )
+            ssh = self.create_ssh_client(ip, password)
 
             transport = ssh.get_transport()
             if transport:
-                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
+                transport.set_keepalive(self.ssh_keepalive)
             
             self.log(f"Wykonywanie: sudo update-axcf{plc_type}")
             stdin, stdout, stderr = ssh.exec_command(f"sudo update-axcf{plc_type}", get_pty=True)
@@ -2490,7 +2955,7 @@ class BatchProcessorApp(tk.Tk):
                 raise Exception(f"Update zwrócił błąd:\n{output}\n{errors}")
             
             self.status_bar.config(text="Gotowy")
-            self.log(f"✓ Aktualizacja zakończona - sterownik restartuje się")
+            self.log(f"Aktualizacja zakończona - sterownik restartuje się")
             self.after(0, lambda: messagebox.showinfo(
                 "Sukces",
                 "Aktualizacja firmware zakończona!\n"
@@ -2500,7 +2965,7 @@ class BatchProcessorApp(tk.Tk):
             
         except Exception as e:
             self.status_bar.config(text="Błąd")
-            self.log(f"✗ Błąd aktualizacji: {str(e)}")
+            self.log(f"Błąd aktualizacji: {str(e)}")
             self.after(0, lambda: messagebox.showerror("Błąd", f"Błąd:\n{str(e)}"))
 
 
