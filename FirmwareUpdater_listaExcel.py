@@ -26,6 +26,10 @@ TIMEZONE = "Europe/Warsaw"
 SYSTEM_SERVICES_FILE = "Default.scm.config"
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 10
+SSH_KEEPALIVE_INTERVAL = 30
+POST_REBOOT_INITIAL_WAIT = 60
+POST_REBOOT_GLOBAL_TIMEOUT = 300
+POST_REBOOT_POLL_INTERVAL = 5
 
 def resource_path(relative_path):
     """Zwraca absolutną ścieżkę do pliku, działa również w exe PyInstaller."""
@@ -34,6 +38,10 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+class FatalUpdateError(Exception):
+    """Błąd krytyczny - operacja nie powinna być ponawiana (bez retry)."""
+    pass
 
 class PLCDevice:
     """Klasa reprezentująca jeden sterownik PLC."""
@@ -73,6 +81,7 @@ class BatchProcessorApp(tk.Tk):
         self.devices = []
         self.processing = False
         self.log_queue = queue.Queue()
+        self.upload_log_progress = {}
         
         # Tworzenie GUI
         self.create_widgets()
@@ -109,6 +118,10 @@ class BatchProcessorApp(tk.Tk):
                 allow_agent=False,
                 look_for_keys=False
             )
+
+            transport = ssh.get_transport()
+            if transport:
+                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
             
             sftp = ssh.open_sftp()
             
@@ -143,6 +156,74 @@ class BatchProcessorApp(tk.Tk):
                     time.sleep(1) 
                 except Exception as e:
                     self.log(f"  ⚠️  Błąd zamykania SSH: {str(e)}")
+
+    def wait_for_ssh_back(self, device):
+        """Po restarcie czeka aktywnie na ponowną dostępność SSH sterownika."""
+        max_attempts = max(1, int(POST_REBOOT_GLOBAL_TIMEOUT / POST_REBOOT_POLL_INTERVAL))
+        self.log(
+            f"  ⏳ Oczekiwanie po restarcie: start po {POST_REBOOT_INITIAL_WAIT}s, "
+            f"timeout globalny {POST_REBOOT_GLOBAL_TIMEOUT}s, "
+            f"max prób reconnect: ~{max_attempts}"
+        )
+        time.sleep(POST_REBOOT_INITIAL_WAIT)
+
+        start_time = time.time()
+        attempt = 0
+
+        while (time.time() - start_time) < POST_REBOOT_GLOBAL_TIMEOUT:
+            attempt += 1
+            test_ssh = None
+            try:
+                test_ssh = paramiko.SSHClient()
+                test_ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                test_ssh.connect(
+                    device.ip,
+                    username=PLC_USER,
+                    password=device.password,
+                    timeout=10,
+                    banner_timeout=10,
+                    auth_timeout=10,
+                    allow_agent=False,
+                    look_for_keys=False
+                )
+
+                transport = test_ssh.get_transport()
+                if transport:
+                    transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
+
+                self.log(f"  ✓ Sterownik {device.ip} wrócił online (próba {attempt})")
+                return True
+            except Exception:
+                elapsed = int(time.time() - start_time)
+                self.log(
+                    f"  ⏳ Reconnect próba {attempt}/{max_attempts} nieudana "
+                    f"({elapsed}s/{POST_REBOOT_GLOBAL_TIMEOUT}s)"
+                )
+                time.sleep(POST_REBOOT_POLL_INTERVAL)
+            finally:
+                if test_ssh:
+                    try:
+                        test_ssh.close()
+                    except:
+                        pass
+
+        raise Exception(
+            f"Sterownik nie wrócił online po {POST_REBOOT_GLOBAL_TIMEOUT}s "
+            f"od pierwszej próby połączenia (wykonano {attempt} prób reconnect)"
+        )
+
+    def is_transient_error(self, error):
+        """Błędy tymczasowe - można ponawiać."""
+        error_msg = str(error).lower()
+        transient_keywords = [
+            "timeout", "timed out", "eof", "socket", "connection reset",
+            "connection refused", "network", "host unreachable", "banner"
+        ]
+        return any(keyword in error_msg for keyword in transient_keywords)
+
+    def is_fatal_error(self, error):
+        """Błędy krytyczne - bez retry."""
+        return isinstance(error, FatalUpdateError)
         
 
 
@@ -164,6 +245,10 @@ class BatchProcessorApp(tk.Tk):
                 allow_agent=False,
                 look_for_keys=False
             )
+
+            transport = ssh.get_transport()
+            if transport:
+                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
             
             update_command = f"sudo update-axcf{device.plc_model}"
             self.log(f"  ⚠️ Uruchamiam: {update_command}")
@@ -207,8 +292,7 @@ class BatchProcessorApp(tk.Tk):
                     self.log(f"  ⚠️ Stderr: {errors[:200]}")
             
             self.log("  ✓ Aktualizacja firmware zakończona. Sterownik restartuje się")
-            self.log("  ⏳ Czekam 30s na restart sterownika...")
-            time.sleep(30)
+            self.wait_for_ssh_back(device)
             
         except Exception as e:
             raise e
@@ -246,8 +330,14 @@ class BatchProcessorApp(tk.Tk):
                 password=device.password, 
                 timeout=30,
                 banner_timeout=30,
-                auth_timeout=30
+                auth_timeout=30,
+                allow_agent=False,
+                look_for_keys=False
             )
+
+            transport = ssh.get_transport()
+            if transport:
+                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
             
             self.log("  ⚠️ Uruchamiam 'sudo reboot'...")
             
@@ -271,10 +361,8 @@ class BatchProcessorApp(tk.Tk):
                 except:
                     pass
             time.sleep(1)
-            
-        # Czekaj na restart
-        self.log("  ⏳ Czekam 60s na restart sterownika...")
-        time.sleep(60)
+
+        self.wait_for_ssh_back(device)
 
 
 
@@ -288,7 +376,7 @@ class BatchProcessorApp(tk.Tk):
             percent = (transferred / total) * 100
             
             # Aktualizuj progress bar
-            self.upload_progress['value'] = percent
+            self.after(0, lambda p=percent: self.upload_progress.config(value=p))
             
             # Oblicz rozmiary w MB
             transferred_mb = transferred / 1024 / 1024
@@ -304,11 +392,16 @@ class BatchProcessorApp(tk.Tk):
             ))
             
             # Log co 10%
-            if int(percent) % 10 == 0 and int(percent) > 0:
-                self.log(f"  📊 Upload: {percent:.0f}% ({transferred_mb:.1f}/{total_mb:.1f} MB)")
+            progress_threshold = int(percent // 10) * 10
+            last_logged = self.upload_log_progress.get(filename, 0)
+
+            if progress_threshold >= 10 and progress_threshold > last_logged:
+                self.upload_log_progress[filename] = progress_threshold
+                self.log(f"  📊 Upload: {progress_threshold}% ({transferred_mb:.1f}/{total_mb:.1f} MB)")
 
     def reset_upload_progress(self):
         """Resetuje progress bar po zakończeniu uploadu."""
+        self.upload_log_progress.clear()
         self.after(0, lambda: self.upload_progress.config(value=0))
         self.after(0, lambda: self.upload_status_label.config(
             text="Oczekiwanie na transfer...",
@@ -359,7 +452,10 @@ class BatchProcessorApp(tk.Tk):
                 attempt += 1
                 
                 if attempt > 1:
-                    self.log(f"⚠️  Próba {attempt}/{RETRY_ATTEMPTS}")
+                    self.log(
+                        f"⚠️  Retry próba {attempt}/{RETRY_ATTEMPTS} "
+                        f"(pozostało {RETRY_ATTEMPTS - attempt + 1} prób)"
+                    )
                     time.sleep(RETRY_DELAY)
                 
                 try:
@@ -391,13 +487,29 @@ class BatchProcessorApp(tk.Tk):
                 except Exception as e:
                     error_msg = str(e)
                     device.error_log = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {error_msg}"
-                    
-                    if attempt < RETRY_ATTEMPTS:
-                        self.log(f"✗ Błąd (próba {attempt}/{RETRY_ATTEMPTS}): {error_msg}")
+
+                    if self.is_fatal_error(e):
+                        device.status = "✗ Błąd"
+                        failed_count += 1
+                        self.log(f"✗ [{device.name}] Błąd krytyczny (bez retry): {error_msg}")
+                        break
+
+                    if self.is_transient_error(e) and attempt < RETRY_ATTEMPTS:
+                        self.log(
+                            f"✗ Błąd tymczasowy (próba {attempt}/{RETRY_ATTEMPTS}): {error_msg}"
+                        )
+                        self.log(
+                            f"  ⏳ Kolejny retry za {RETRY_DELAY}s "
+                            f"(pozostało {RETRY_ATTEMPTS - attempt} prób)"
+                        )
                     else:
                         device.status = "✗ Błąd"
                         failed_count += 1
-                        self.log(f"✗ [{device.name}] Operacja nieudana po {RETRY_ATTEMPTS} próbach: {error_msg}")
+                        if self.is_transient_error(e):
+                            self.log(f"✗ [{device.name}] Operacja nieudana po {RETRY_ATTEMPTS} próbach: {error_msg}")
+                        else:
+                            self.log(f"✗ [{device.name}] Błąd nienaprawialny (bez retry): {error_msg}")
+                        break
                 
                 finally:
                     self.after(0, lambda d=device: self.update_device_row(d))
@@ -1057,7 +1169,7 @@ class BatchProcessorApp(tk.Tk):
         self.log(f"  🔍 {compat_msg}")
         
         if not is_compatible:
-            raise Exception(compat_msg)
+            raise FatalUpdateError(compat_msg)
         
         # Sprawdź czy firmware jest aktualny
         if self.compare_firmware_versions(device.firmware_version, firmware_file):
@@ -1236,7 +1348,7 @@ class BatchProcessorApp(tk.Tk):
                 
                 local_sys_file = resource_path(SYSTEM_SERVICES_FILE)
                 if not os.path.exists(local_sys_file):
-                    raise Exception(f"Plik {SYSTEM_SERVICES_FILE} nie istnieje!")
+                    raise FatalUpdateError(f"Plik {SYSTEM_SERVICES_FILE} nie istnieje!")
                 
                 remote_sys_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
                 filename = os.path.basename(local_sys_file)
@@ -1371,7 +1483,7 @@ class BatchProcessorApp(tk.Tk):
                 self.log(f"  🔍 {compat_msg}")
                 
                 if not is_compatible:
-                    raise Exception(f"❌ {compat_msg}\n\n⚠️ ZATRZYMANO AKTUALIZACJĘ!")
+                    raise FatalUpdateError(f"❌ {compat_msg}\n\n⚠️ ZATRZYMANO AKTUALIZACJĘ!")
                 
                 # 3. Odczyt wstępny danych
                 self.log("  📖 Wstępny odczyt danych...")
@@ -1435,7 +1547,7 @@ class BatchProcessorApp(tk.Tk):
                     
                     local_sys_file = resource_path(SYSTEM_SERVICES_FILE)
                     if not os.path.exists(local_sys_file):
-                        raise Exception(f"Plik {SYSTEM_SERVICES_FILE} nie istnieje lokalnie!")
+                        raise FatalUpdateError(f"Plik {SYSTEM_SERVICES_FILE} nie istnieje lokalnie!")
                     
                     remote_sys_path = "/opt/plcnext/config/System/Scm/Default.scm.config"
                     filename = os.path.basename(local_sys_file)
@@ -1519,10 +1631,7 @@ class BatchProcessorApp(tk.Tk):
                 else:
                     self.log("  🕐 Strefa czasowa OK - pomijam zmianę")
                 
-                # Zamknij SFTP PRZED jakimkolwiek rebootem/update
-                self.log("  🔒 Zamykam SFTP przed rebootem/update...")
-                sftp.close()
-                time.sleep(1)
+                self.log("  ✓ Wszystkie transfery zakończone")
             
             # Context manager zamknął SSH tutaj - wszystkie transfery zakończone!
             
@@ -1828,6 +1937,10 @@ class BatchProcessorApp(tk.Tk):
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             ssh.connect(ip, username=PLC_USER, password=password, timeout=30)
+
+            transport = ssh.get_transport()
+            if transport:
+                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
             
             sftp = ssh.open_sftp()
             filename = os.path.basename(firmware_file)
@@ -1899,7 +2012,20 @@ class BatchProcessorApp(tk.Tk):
             
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(ip, username=PLC_USER, password=password, timeout=30)
+            ssh.connect(
+                ip,
+                username=PLC_USER,
+                password=password,
+                timeout=30,
+                banner_timeout=30,
+                auth_timeout=30,
+                allow_agent=False,
+                look_for_keys=False
+            )
+
+            transport = ssh.get_transport()
+            if transport:
+                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
             
             self.log(f"Wykonywanie: sudo update-axcf{plc_type}")
             stdin, stdout, stderr = ssh.exec_command(f"sudo update-axcf{plc_type}", get_pty=True)
