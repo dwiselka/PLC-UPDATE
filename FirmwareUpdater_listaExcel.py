@@ -1,6 +1,4 @@
 import paramiko
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, scrolledtext
 import threading
 import os
 import time
@@ -14,6 +12,243 @@ from openpyxl.styles import PatternFill, Font
 import queue
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import importlib
+from PySide6.QtCore import Qt, QTimer, QObject, Signal
+from PySide6.QtGui import QColor, QBrush, QIcon, QTextCursor
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QPushButton,
+    QLabel,
+    QProgressBar,
+    QComboBox,
+    QLineEdit,
+    QSpinBox,
+    QTextEdit,
+    QFileDialog,
+    QCheckBox,
+    QGroupBox,
+    QHeaderView,
+    QMessageBox,
+    QRadioButton,
+    QButtonGroup,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QPlainTextEdit,
+)
+
+try:
+    qdarktheme = importlib.import_module("qdarktheme")
+except Exception:
+    qdarktheme = None
+
+try:
+    apply_stylesheet = importlib.import_module("qt_material").apply_stylesheet
+except Exception:
+    apply_stylesheet = None
+
+
+class TkConstants:
+    END = "end"
+    WORD = "word"
+
+
+tk = TkConstants()
+
+
+class QtVariable:
+    def __init__(self, value=None):
+        self._value = value
+        self._callbacks = []
+
+    def get(self):
+        return self._value
+
+    def set(self, value):
+        self._value = value
+        for callback in self._callbacks:
+            try:
+                callback("", "", "")
+            except TypeError:
+                callback()
+
+    def trace_add(self, _mode, callback):
+        self._callbacks.append(callback)
+
+
+class StringVar(QtVariable):
+    def __init__(self, value=""):
+        super().__init__(value)
+
+
+class BooleanVar(QtVariable):
+    def __init__(self, value=False):
+        super().__init__(bool(value))
+
+    def set(self, value):
+        super().set(bool(value))
+
+
+class IntVar(QtVariable):
+    def __init__(self, value=0):
+        super().__init__(int(value))
+
+    def set(self, value):
+        super().set(int(value))
+
+
+class CompatButton(QPushButton):
+    def config(self, **kwargs):
+        state = kwargs.get("state")
+        if state is not None:
+            self.setEnabled(state != "disabled")
+        if "text" in kwargs:
+            self.setText(kwargs["text"])
+
+
+class CompatLabel(QLabel):
+    def config(self, **kwargs):
+        if "text" in kwargs:
+            self.setText(kwargs["text"])
+
+
+class CompatProgressBar(QProgressBar):
+    def config(self, **kwargs):
+        if "value" in kwargs:
+            self.setValue(int(kwargs["value"]))
+
+
+class CompatLineEdit(QLineEdit):
+    def get(self):
+        return self.text()
+
+    def delete(self, start, end=None):
+        if start == 0:
+            self.clear()
+            return
+        self.setText("")
+
+    def insert(self, index, text):
+        if index == 0:
+            self.setText(text)
+        else:
+            current = self.text()
+            self.setText(current[:index] + text + current[index:])
+
+
+class CompatTextEdit(QPlainTextEdit):
+    def insert(self, _pos, text):
+        self.appendPlainText(text.rstrip("\n"))
+
+    def see(self, _pos):
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.setTextCursor(cursor)
+
+    def delete(self, _start, _end):
+        self.clear()
+
+
+class CompatTreeWidget(QTreeWidget):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tag_styles = {}
+
+    def tag_configure(self, tag, background=None, foreground=None):
+        self._tag_styles[tag] = {
+            "background": QColor(background) if background else None,
+            "foreground": QColor(foreground) if foreground else None,
+        }
+
+    def get_children(self):
+        return [self.topLevelItem(i) for i in range(self.topLevelItemCount())]
+
+    def delete(self, *items):
+        if not items:
+            self.clear()
+            return
+        for item in items:
+            idx = self.indexOfTopLevelItem(item)
+            if idx >= 0:
+                self.takeTopLevelItem(idx)
+
+    def insert(self, _parent, _where, text="", values=(), tags=()):
+        item = QTreeWidgetItem([text] + [str(v) for v in values])
+        for tag in tags:
+            style = self._tag_styles.get(tag, {})
+            bg = style.get("background")
+            fg = style.get("foreground")
+            for col in range(item.columnCount()):
+                if bg:
+                    item.setBackground(col, QBrush(bg))
+                if fg:
+                    item.setForeground(col, QBrush(fg))
+        self.addTopLevelItem(item)
+        return item
+
+    def update_idletasks(self):
+        QApplication.processEvents()
+
+
+class FileDialogCompat:
+    @staticmethod
+    def askopenfilename(title="Wybierz plik", filetypes=None):
+        if filetypes:
+            filters = []
+            for label, pattern in filetypes:
+                qt_pattern = pattern.replace(" ", " ")
+                filters.append(f"{label} ({qt_pattern})")
+            selected_filter = ";;".join(filters)
+        else:
+            selected_filter = "All files (*)"
+        path, _ = QFileDialog.getOpenFileName(None, title, "", selected_filter)
+        return path
+
+    @staticmethod
+    def asksaveasfilename(defaultextension="", filetypes=None, initialfile=""):
+        if filetypes:
+            filters = ";;".join(f"{label} ({pattern})" for label, pattern in filetypes)
+        else:
+            filters = "All files (*)"
+        path, _ = QFileDialog.getSaveFileName(None, "Zapisz plik", initialfile, filters)
+        if path and defaultextension and not path.lower().endswith(defaultextension.lower()):
+            path += defaultextension
+        return path
+
+
+class MessageBoxCompat:
+    @staticmethod
+    def showinfo(title, text):
+        QMessageBox.information(None, title, text)
+
+    @staticmethod
+    def showwarning(title, text):
+        QMessageBox.warning(None, title, text)
+
+    @staticmethod
+    def showerror(title, text):
+        QMessageBox.critical(None, title, text)
+
+    @staticmethod
+    def askyesno(title, text):
+        result = QMessageBox.question(None, title, text, QMessageBox.Yes | QMessageBox.No)
+        return result == QMessageBox.Yes
+
+
+filedialog = FileDialogCompat()
+messagebox = MessageBoxCompat()
+
+
+class UiBridge(QObject):
+    invoke = Signal(object)
+
 
 # cd "C:\Users\dawid.wiselka\OneDrive - NOMAD ELECTRIC Sp. z o.o\Dokumenty\Farmy\Updater\all\PLC-UPDATE"
 # python FirmwareUpdater_listaExcel.py
@@ -96,80 +331,37 @@ class PLCDevice:
         self.plc_time = ""
         self.time_sync_error = False
 
-class BatchProcessorApp(tk.Tk):
+class BatchProcessorApp(QMainWindow):
     """Główna aplikacja do przetwarzania wsadowego sterowników PLC."""
 
     def __init__(self):
+        self._qt_app = QApplication.instance() or QApplication(sys.argv)
         super().__init__()
-        self.title("PLC Batch Updater - Phoenix Contact")
-        self.geometry("1300x850")
-        self.configure(bg="#F0F4F8")
+        self.setWindowTitle("PLC Batch Updater - Phoenix Contact")
+        self.resize(1300, 850)
         try:
-            self.iconbitmap(resource_path("plcv2.ico"))
-        except:
+            self.setWindowIcon(QIcon(resource_path("plcv2.ico")))
+        except Exception:
             pass
 
-        style = ttk.Style()
         try:
-            style.theme_use('clam')
-        except:
+            if qdarktheme:
+                qdarktheme.setup_theme("dark")
+            if apply_stylesheet:
+                apply_stylesheet(self._qt_app, theme="dark_teal.xml")
+        except Exception:
             pass
-
-        # Nowoczesny schemat kolorów
-        style.configure('TNotebook', 
-                       background="#F0F4F8", 
-                       borderwidth=0,
-                       tabmargins=[2, 5, 2, 0])
-        
-        style.configure('TNotebook.Tab', 
-                       font=('Segoe UI', 11, 'bold'),
-                       padding=(20, 10),
-                       borderwidth=0)
-        
-        style.map('TNotebook.Tab',
-                  background=[('selected', '#FFFFFF'), ('!selected', '#CBD5E1')],
-                  foreground=[('selected', '#1E40AF'), ('!selected', '#475569')],
-                  expand=[('selected', [1, 1, 1, 0])])
-
-        # Nowoczesna tabela
-        style.configure('Modern.Treeview',
-                        font=('Segoe UI', 10),
-                        rowheight=32,
-                        background='#FFFFFF',
-                        fieldbackground='#FFFFFF',
-                        borderwidth=0)
-        
-        style.configure('Modern.Treeview.Heading',
-                        font=('Segoe UI', 10, 'bold'),
-                        background='#E2E8F0',
-                        foreground='#1E293B',
-                        relief='flat',
-                        borderwidth=1)
-        
-        style.map('Modern.Treeview',
-                  background=[('selected', '#DBEAFE')],
-                  foreground=[('selected', '#1E293B')])
-        
-        style.map('Modern.Treeview.Heading',
-                  background=[('active', '#CBD5E1')])
-        
-        # Progress bar style
-        style.configure('Custom.Horizontal.TProgressbar',
-                       troughcolor='#E2E8F0',
-                       background='#3B82F6',
-                       bordercolor='#CBD5E1',
-                       lightcolor='#60A5FA',
-                       darkcolor='#2563EB',
-                       thickness=20)
 
         # Zmienne stanu
-        self.excel_path = tk.StringVar()
-        self.firmware_path = tk.StringVar()
+        self.excel_path = StringVar()
+        self.firmware_path = StringVar()
         self.devices = []
         self.processing = False
         self.log_queue = queue.Queue()
         self.upload_log_progress = {}
-        self.show_errors_only = tk.BooleanVar(value=False)
+        self.show_errors_only = BooleanVar(value=False)
+        self._ui_bridge = UiBridge()
+        self._ui_bridge.invoke.connect(self._run_ui_callback)
         
         # Konfigurowalne ustawienia (domyślne wartości)
         self.ssh_timeout = DEFAULT_SSH_TIMEOUT
@@ -195,46 +387,37 @@ class BatchProcessorApp(tk.Tk):
         # Timer do aktualizacji logów
         self.update_logs()
 
+    def _run_ui_callback(self, callback):
+        callback()
+
+    def after(self, delay_ms, callback):
+        if delay_ms <= 0:
+            self._ui_bridge.invoke.emit(callback)
+        else:
+            QTimer.singleShot(delay_ms, lambda: self._ui_bridge.invoke.emit(callback))
+
+    def mainloop(self):
+        self.show()
+        return self._qt_app.exec()
+
     def create_action_button(self, parent, text, command, variant="neutral", **kwargs):
         """Tworzy nowoczesny przycisk z lepszym designem."""
-        palette = {
-            "neutral": {"bg": "#E2E8F0", "fg": "#1E293B", "active": "#CBD5E1", "border": "#94A3B8"},
-            "primary": {"bg": "#3B82F6", "fg": "#FFFFFF", "active": "#2563EB", "border": "#1D4ED8"},
-            "success": {"bg": "#10B981", "fg": "#FFFFFF", "active": "#059669", "border": "#047857"},
-            "warning": {"bg": "#F59E0B", "fg": "#FFFFFF", "active": "#D97706", "border": "#B45309"},
-            "danger": {"bg": "#EF4444", "fg": "#FFFFFF", "active": "#DC2626", "border": "#B91C1C"},
-            "info": {"bg": "#06B6D4", "fg": "#FFFFFF", "active": "#0891B2", "border": "#0E7490"},
-            "accent": {"bg": "#8B5CF6", "fg": "#FFFFFF", "active": "#7C3AED", "border": "#6D28D9"}
+        btn = CompatButton(text, parent)
+        btn.clicked.connect(command)
+        btn.setCursor(Qt.PointingHandCursor)
+        if kwargs.get("state") == "disabled":
+            btn.setEnabled(False)
+
+        variant_styles = {
+            "neutral": "background-color: #475569; color: white;",
+            "primary": "background-color: #2563EB; color: white;",
+            "success": "background-color: #059669; color: white;",
+            "warning": "background-color: #D97706; color: white;",
+            "danger": "background-color: #DC2626; color: white;",
+            "info": "background-color: #0891B2; color: white;",
+            "accent": "background-color: #7C3AED; color: white;",
         }
-
-        color = palette.get(variant, palette["neutral"])
-        style = ttk.Style()
-        style_name = f"Modern.{variant}.TButton"
-        style.configure(
-            style_name,
-            font=("Segoe UI", 11, "bold"),
-            padding=(16, 10),
-            foreground=color["fg"],
-            background=color["bg"],
-            relief="flat",
-            borderwidth=1,
-            bordercolor=color["border"]
-        )
-        style.map(
-            style_name,
-            background=[('active', color["active"]), ('pressed', color["active"]), ('disabled', '#CBD5E1')],
-            foreground=[('disabled', '#94A3B8')],
-            relief=[('pressed', 'flat'), ('!pressed', 'flat')]
-        )
-
-        btn = ttk.Button(
-            parent,
-            text=text,
-            command=command,
-            style=style_name,
-            cursor="hand2",
-            **kwargs
-        )
+        btn.setStyleSheet(f"padding: 8px 12px; border-radius: 8px; font-weight: 600; {variant_styles.get(variant, variant_styles['neutral'])}")
         return btn
 
 
@@ -1182,347 +1365,275 @@ class BatchProcessorApp(tk.Tk):
         return ""
 
     def create_widgets(self):
-        """Tworzy nowoczesny interfejs użytkownika."""
-        
-        # Notebook (zakładki)
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True, padx=8, pady=8)
-        
-        # ZAKŁADKA 1: Przetwarzanie wsadowe
-        batch_frame = tk.Frame(notebook, bg="#F8FAFC")
-        notebook.add(batch_frame, text="Przetwarzanie wsadowe")
-        
-        # Sekcja pliku Excel
-        excel_frame = tk.LabelFrame(batch_frame, 
-                                    text="  Plik Excel z listą sterowników  ", 
-                                    padx=15, pady=12,
-                                    font=('Segoe UI', 11, 'bold'),
-                                    fg="#1E293B",
-                                    bg="#F8FAFC",
-                                    relief="solid",
-                                    borderwidth=1)
-        excel_frame.pack(fill="x", padx=12, pady=8)
-        
-        self.create_action_button(
-            excel_frame,
-            text="Wybierz plik Excel",
-            command=self.select_excel,
-            variant="neutral"
-        ).pack(side="left", padx=5)
+        """Tworzy interfejs użytkownika w PySide6."""
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
 
-        tk.Label(excel_frame, 
-                textvariable=self.excel_path, 
-                bg="#FFFFFF", 
-                fg="#475569",
-                relief="groove", 
-                borderwidth=1,
-                font=('Segoe UI', 10),
-                width=55,
-                anchor="w",
-                padx=8, pady=6).pack(side="left", padx=8)
+        notebook = QTabWidget(central)
+        main_layout.addWidget(notebook)
 
-        self.load_excel_btn = self.create_action_button(
-            excel_frame,
-            text="Wczytaj listę",
-            command=self.load_excel,
-            variant="primary"
-        )
-        self.load_excel_btn.pack(side="left", padx=5)
-        
-        # Sekcja firmware
-        firmware_frame = tk.LabelFrame(batch_frame, 
-                                       text="  Plik Firmware (opcjonalnie dla aktualizacji)  ", 
-                                       padx=15, pady=12,
-                                       font=('Segoe UI', 11, 'bold'),
-                                       fg="#1E293B",
-                                       bg="#F8FAFC",
-                                       relief="solid",
-                                       borderwidth=1)
-        firmware_frame.pack(fill="x", padx=12, pady=8)
-        
-        self.create_action_button(
-            firmware_frame,
-            text="Wybierz firmware",
-            command=self.select_firmware,
-            variant="neutral"
-        ).pack(side="left", padx=5)
+        batch_tab = QWidget()
+        notebook.addTab(batch_tab, "Przetwarzanie wsadowe")
+        batch_layout = QVBoxLayout(batch_tab)
 
-        tk.Label(firmware_frame, 
-                textvariable=self.firmware_path, 
-                bg="#FFFFFF", 
-                fg="#475569",
-                relief="groove", 
-                borderwidth=1,
-                font=('Segoe UI', 10),
-                width=55,
-                anchor="w",
-                padx=8, pady=6).pack(side="left", padx=8)
-        """
-        # Typ sterownika
-        plc_frame = tk.LabelFrame(batch_frame, text="Typ sterownika", padx=10, pady=5)
-        plc_frame.pack(fill="x", padx=10, pady=5)
-        tk.Radiobutton(plc_frame, text="AXC F 2152", variable=self.plc_type_var, value="2152").pack(side="left", padx=10)
-        tk.Radiobutton(plc_frame, text="AXC F 3152", variable=self.plc_type_var, value="3152").pack(side="left", padx=10)
-        """
-        # Przyciski akcji - ODCZYT
-        read_frame = tk.LabelFrame(batch_frame, 
-                                  text="  Odczyt danych  ", 
-                                  padx=15, pady=10,
-                                  font=('Segoe UI', 11, 'bold'),
-                                  fg="#1E293B",
-                                  bg="#F8FAFC",
-                                  relief="solid",
-                                  borderwidth=1)
-        read_frame.pack(fill="x", padx=12, pady=8)
-        self.batch_read_btn = self.create_action_button(
-            read_frame,
-            text="Odczytaj wszystkie sterowniki",
-            command=self.batch_read_all,
-            variant="success"
-        )
-        self.batch_read_btn.pack(fill="x", padx=5, pady=5)
+        excel_group = QGroupBox("Plik Excel z listą sterowników")
+        excel_layout = QHBoxLayout(excel_group)
+        excel_layout.addWidget(self.create_action_button(excel_group, "Wybierz plik Excel", self.select_excel, "neutral"))
+        self.excel_path_label = QLineEdit()
+        self.excel_path_label.setReadOnly(True)
+        excel_layout.addWidget(self.excel_path_label, 1)
+        self.load_excel_btn = self.create_action_button(excel_group, "Wczytaj listę", self.load_excel, "primary")
+        excel_layout.addWidget(self.load_excel_btn)
+        batch_layout.addWidget(excel_group)
 
-        # Przyciski akcji - AKTUALIZACJE (osobne)
-        update_frame = tk.LabelFrame(batch_frame, 
-                                    text="  Aktualizacje (wykonywane osobno)  ", 
-                                    padx=15, pady=10,
-                                    font=('Segoe UI', 11, 'bold'),
-                                    fg="#1E293B",
-                                    bg="#F8FAFC",
-                                    relief="solid",
-                                    borderwidth=1)
-        update_frame.pack(fill="x", padx=12, pady=8)
-        
-        btn_grid = tk.Frame(update_frame, bg="#F8FAFC")
-        btn_grid.pack(fill="x", padx=5, pady=5)
-        
-        self.batch_sys_btn = self.create_action_button(
-            btn_grid,
-            text="Wyślij System Services (wszystkie)",
-            command=self.batch_system_services,
-            variant="info"
-        )
-        self.batch_sys_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        firmware_group = QGroupBox("Plik Firmware (opcjonalnie dla aktualizacji)")
+        firmware_layout = QHBoxLayout(firmware_group)
+        firmware_layout.addWidget(self.create_action_button(firmware_group, "Wybierz firmware", self.select_firmware, "neutral"))
+        self.firmware_path_label = QLineEdit()
+        self.firmware_path_label.setReadOnly(True)
+        firmware_layout.addWidget(self.firmware_path_label, 1)
+        batch_layout.addWidget(firmware_group)
 
-        self.batch_tz_btn = self.create_action_button(
-            btn_grid,
-            text="Ustaw strefę czasową (wszystkie)",
-            command=self.batch_timezone,
-            variant="warning"
-        )
-        self.batch_tz_btn.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        read_group = QGroupBox("Odczyt danych")
+        read_layout = QVBoxLayout(read_group)
+        self.batch_read_btn = self.create_action_button(read_group, "Odczytaj wszystkie sterowniki", self.batch_read_all, "success")
+        read_layout.addWidget(self.batch_read_btn)
+        batch_layout.addWidget(read_group)
 
-        self.batch_fw_btn = self.create_action_button(
-            btn_grid,
-            text="Aktualizuj Firmware (wszystkie)",
-            command=self.batch_firmware_only,
-            variant="primary"
-        )
-        self.batch_fw_btn.grid(row=1, column=0, padx=5, pady=5, sticky="ew")
+        update_group = QGroupBox("Aktualizacje (wykonywane osobno)")
+        update_grid = QGridLayout(update_group)
+        self.batch_sys_btn = self.create_action_button(update_group, "Wyślij System Services (wszystkie)", self.batch_system_services, "info")
+        self.batch_tz_btn = self.create_action_button(update_group, "Ustaw strefę czasową (wszystkie)", self.batch_timezone, "warning")
+        self.batch_fw_btn = self.create_action_button(update_group, "Aktualizuj Firmware (wszystkie)", self.batch_firmware_only, "primary")
+        self.batch_all_btn = self.create_action_button(update_group, "WYKONAJ WSZYSTKO NARAZ", self.batch_update_all, "accent")
+        update_grid.addWidget(self.batch_sys_btn, 0, 0)
+        update_grid.addWidget(self.batch_tz_btn, 0, 1)
+        update_grid.addWidget(self.batch_fw_btn, 1, 0)
+        update_grid.addWidget(self.batch_all_btn, 1, 1)
+        batch_layout.addWidget(update_group)
 
-        self.batch_all_btn = self.create_action_button(
-            btn_grid,
-            text="WYKONAJ WSZYSTKO NARAZ",
-            command=self.batch_update_all,
-            variant="accent"
-        )
-        self.batch_all_btn.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-        
-        btn_grid.columnconfigure(0, weight=1)
-        btn_grid.columnconfigure(1, weight=1)
-        
-        progress_frame = tk.LabelFrame(batch_frame, 
-                                       text="  Status transferu plików  ", 
-                                       padx=15, pady=10,
-                                       font=('Segoe UI', 11, 'bold'),
-                                       fg="#1E293B",
-                                       bg="#F8FAFC",
-                                       relief="solid",
-                                       borderwidth=1)
-        progress_frame.pack(fill="x", padx=12, pady=8)
-        
-        # Progress bar
-        self.upload_progress = ttk.Progressbar(
-            progress_frame, 
-            orient="horizontal", 
-            length=100, 
-            mode="determinate",
-            style="Custom.Horizontal.TProgressbar"
-        )
-        self.upload_progress.pack(fill="x", padx=5, pady=5)
-        
-        # Label ze statusem
-        self.upload_status_label = tk.Label(
-            progress_frame, 
-            text="Oczekiwanie na transfer...",
-            font=("Segoe UI", 10),
-            fg="#64748B",
-            bg="#F8FAFC"
-        )
-        self.upload_status_label.pack(padx=5, pady=4)
+        transfer_group = QGroupBox("Status transferu plików")
+        transfer_layout = QVBoxLayout(transfer_group)
+        self.upload_progress = CompatProgressBar()
+        self.upload_progress.setRange(0, 100)
+        self.upload_status_label = CompatLabel("Oczekiwanie na transfer...")
+        transfer_layout.addWidget(self.upload_progress)
+        transfer_layout.addWidget(self.upload_status_label)
+        batch_layout.addWidget(transfer_group)
 
-        batch_progress_frame = tk.LabelFrame(batch_frame, 
-                                            text="  Postęp operacji wsadowej  ", 
-                                            padx=15, pady=10,
-                                            font=('Segoe UI', 11, 'bold'),
-                                            fg="#1E293B",
-                                            bg="#F8FAFC",
-                                            relief="solid",
-                                            borderwidth=1)
-        batch_progress_frame.pack(fill="x", padx=12, pady=8)
+        batch_progress_group = QGroupBox("Postęp operacji wsadowej")
+        batch_progress_layout = QVBoxLayout(batch_progress_group)
+        self.batch_progress = CompatProgressBar()
+        self.batch_progress.setRange(0, 100)
+        self.batch_progress_label = CompatLabel("Oczekiwanie na start...")
+        batch_progress_layout.addWidget(self.batch_progress)
+        batch_progress_layout.addWidget(self.batch_progress_label)
+        batch_layout.addWidget(batch_progress_group)
 
-        self.batch_progress = ttk.Progressbar(
-            batch_progress_frame,
-            orient="horizontal",
-            length=100,
-            mode="determinate",
-            style="Custom.Horizontal.TProgressbar"
-        )
-        self.batch_progress.pack(fill="x", padx=5, pady=5)
+        controls_layout = QHBoxLayout()
+        self.save_excel_btn = self.create_action_button(batch_tab, "Zapisz raport Excel", self.save_excel, "primary")
+        self.stop_btn = self.create_action_button(batch_tab, "STOP", self.stop_processing, "danger", state="disabled")
+        controls_layout.addWidget(self.save_excel_btn)
+        controls_layout.addWidget(self.stop_btn)
+        batch_layout.addLayout(controls_layout)
 
-        self.batch_progress_label = tk.Label(
-            batch_progress_frame,
-            text="Oczekiwanie na start...",
-            font=("Segoe UI", 10),
-            fg="#64748B",
-            bg="#F8FAFC"
-        )
-        self.batch_progress_label.pack(padx=5, pady=4)
-    
+        self.show_errors_checkbox = QCheckBox("Pokaż tylko sterowniki z problemami")
+        self.show_errors_checkbox.stateChanged.connect(lambda state: (self.show_errors_only.set(state == Qt.Checked), self.refresh_device_tree()))
+        batch_layout.addWidget(self.show_errors_checkbox)
 
-        control_frame = tk.Frame(batch_frame, bg="#F8FAFC")
-        control_frame.pack(fill="x", padx=12, pady=8)
-
-        self.save_excel_btn = self.create_action_button(
-            control_frame,
-            text="Zapisz raport Excel",
-            command=self.save_excel,
-            variant="primary"
-        )
-        self.save_excel_btn.pack(side="left", padx=5, fill="x", expand=True)
-
-        self.stop_btn = self.create_action_button(
-            control_frame,
-            text="STOP",
-            command=self.stop_processing,
-            variant="danger",
-            state="disabled"
-        )
-        self.stop_btn.pack(side="left", padx=5, fill="x", expand=True)
-
-        filter_frame = tk.Frame(batch_frame, bg="#F8FAFC")
-        filter_frame.pack(fill="x", padx=12, pady=(0, 5))
-        tk.Checkbutton(
-            filter_frame,
-            text="Pokaż tylko sterowniki z problemami",
-            variable=self.show_errors_only,
-            command=self.refresh_device_tree,
-            font=('Segoe UI', 10),
-            bg="#F8FAFC",
-            fg="#1E293B",
-            selectcolor="#FFFFFF",
-            activebackground="#F8FAFC",
-            relief="flat"
-        ).pack(side="left", padx=5)
-        
-        # Tabela ze sterownikami
-        table_frame = tk.LabelFrame(batch_frame, 
-                                   text="  Lista sterowników  ", 
-                                   padx=10, pady=10,
-                                   font=('Segoe UI', 11, 'bold'),
-                                   fg="#1E293B",
-                                   bg="#F8FAFC",
-                                   relief="solid",
-                                   borderwidth=1)
-        table_frame.pack(fill="both", expand=True, padx=12, pady=8)
-
-            # Scrollbar
-        table_scroll_y = tk.Scrollbar(table_frame, orient="vertical")
-        table_scroll_x = tk.Scrollbar(table_frame, orient="horizontal")
-
-        self.device_tree = ttk.Treeview(table_frame, 
-                                columns=("IP", "Model", "Firmware", "PLCTime", "Timezone", "SysServices", "LastCheck", "Status", "Issues"),
-                                show="tree headings",
-                                style='Modern.Treeview',
-                                yscrollcommand=table_scroll_y.set,
-                                xscrollcommand=table_scroll_x.set)
-
-        table_scroll_y.config(command=self.device_tree.yview)
-        table_scroll_x.config(command=self.device_tree.xview)
-
-        self.device_tree.heading("#0", text="Nazwa")
-        self.device_tree.heading("IP", text="IP")
-        self.device_tree.heading("Model", text="Model PLC")
-        self.device_tree.heading("Firmware", text="Wersja Firmware")
-        self.device_tree.heading("PLCTime", text="Czas sterownika")
-        self.device_tree.heading("Timezone", text="Strefa czasowa")
-        self.device_tree.heading("SysServices", text="System Services")
-        self.device_tree.heading("LastCheck", text="Ostatni odczyt")
-        self.device_tree.heading("Status", text="Status")
-        self.device_tree.heading("Issues", text="Issues") 
-
-        self.device_tree.column("#0", width=150)
-        self.device_tree.column("IP", width=90)
-        self.device_tree.column("Model", width=80)
-        self.device_tree.column("Firmware", width=100)
-        self.device_tree.column("PLCTime", width=150)
-        self.device_tree.column("Timezone", width=120)
-        self.device_tree.column("SysServices", width=100)
-        self.device_tree.column("LastCheck", width=150)
-        self.device_tree.column("Status", width=80)
-        self.device_tree.column("Issues", width=150)
-
-        # Konfiguracja tagów dla kolorowania
+        table_group = QGroupBox("Lista sterowników")
+        table_layout = QVBoxLayout(table_group)
+        self.device_tree = CompatTreeWidget()
+        self.device_tree.setColumnCount(10)
+        self.device_tree.setHeaderLabels([
+            "Nazwa", "IP", "Model PLC", "Wersja Firmware", "Czas sterownika",
+            "Strefa czasowa", "System Services", "Ostatni odczyt", "Status", "Issues"
+        ])
+        self.device_tree.header().setSectionResizeMode(QHeaderView.Interactive)
         self.device_tree.tag_configure('success', background='#D1FAE5', foreground='#065F46')
         self.device_tree.tag_configure('error', background='#FEE2E2', foreground='#991B1B')
         self.device_tree.tag_configure('has_issues', background='#FEF3C7', foreground='#92400E')
+        table_layout.addWidget(self.device_tree)
+        batch_layout.addWidget(table_group, 1)
 
-        self.device_tree.pack(side="left", fill="both", expand=True)
-        table_scroll_y.pack(side="right", fill="y")
-        table_scroll_x.pack(side="bottom", fill="x")
+        log_tab = QWidget()
+        notebook.addTab(log_tab, "Logi operacji")
+        log_layout = QVBoxLayout(log_tab)
+        self.log_text = CompatTextEdit()
+        self.log_text.setReadOnly(True)
+        log_layout.addWidget(self.log_text)
+        log_layout.addWidget(self.create_action_button(log_tab, "Wyczysc logi", self.clear_logs, "neutral"))
 
+        config_tab = QWidget()
+        notebook.addTab(config_tab, "Konfiguracja")
+        self.create_config_interface(config_tab)
 
-        # ZAKŁADKA 2: Logi
-        log_frame = tk.Frame(notebook, bg="#F8FAFC")
-        notebook.add(log_frame, text="Logi operacji")
+        manual_tab = QWidget()
+        notebook.addTab(manual_tab, "Reczna obsluga")
+        self.create_manual_interface(manual_tab)
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, 
-                                                   wrap=tk.WORD, 
-                                                   font=("Consolas", 10),
-                                                   bg="#1E293B",
-                                                   fg="#E2E8F0",
-                                                   insertbackground="#60A5FA",
-                                                   relief="flat",
-                                                   borderwidth=0)
-        self.log_text.pack(fill="both", expand=True, padx=12, pady=12)
+        self.status_bar = CompatLabel("Gotowy")
+        self.status_bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        main_layout.addWidget(self.status_bar)
 
-        self.create_action_button(
-            log_frame,
-            text="Wyczysc logi",
-            command=self.clear_logs,
-            variant="neutral"
-        ).pack(pady=8)
+        self.excel_path.trace_add("write", lambda *_: self.excel_path_label.setText(self.excel_path.get()))
+        self.firmware_path.trace_add("write", lambda *_: self.firmware_path_label.setText(self.firmware_path.get()))
 
-        # ZAKŁADKA 3: Konfiguracja
-        config_frame = tk.Frame(notebook, bg="#F8FAFC")
-        notebook.add(config_frame, text="Konfiguracja")
-        self.create_config_interface(config_frame)
+    def _create_spin_row(self, layout, row, label_text, int_var, minimum, maximum, step=1, suffix=""):
+        label = QLabel(label_text)
+        spin = QSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setSingleStep(step)
+        spin.setValue(int_var.get())
+        if suffix:
+            spin.setSuffix(suffix)
+        spin.valueChanged.connect(int_var.set)
+        int_var._spin = spin
+        layout.addWidget(label, row, 0)
+        layout.addWidget(spin, row, 1)
 
-        # ZAKŁADKA 4: Ręczna obsługa (poprawiona)
-        manual_frame = tk.Frame(notebook, bg="#F8FAFC")
-        notebook.add(manual_frame, text="Reczna obsluga")
-        self.create_manual_interface(manual_frame)
+    def _set_config_var(self, var, value):
+        var.set(value)
+        spin = getattr(var, "_spin", None)
+        if spin and spin.value() != value:
+            was_blocked = spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(was_blocked)
 
-        # Status bar
-        self.status_bar = tk.Label(self, 
-                                   text="Gotowy", 
-                                   relief="flat", 
-                                   anchor="w", 
-                                   bg="#E2E8F0",
-                                   fg="#1E293B",
-                                   font=("Segoe UI", 10),
-                                   padx=10, pady=6)
-        self.status_bar.pack(side="bottom", fill="x")
+    def _sync_config_vars_from_controls(self):
+        config_vars = [
+            self.ssh_timeout_var,
+            self.ssh_keepalive_var,
+            self.retry_attempts_var,
+            self.retry_delay_var,
+            self.pause_between_var,
+            self.upload_timeout_var,
+            self.update_command_timeout_var,
+            self.idle_timeout_var,
+            self.post_reboot_wait_var,
+            self.post_reboot_timeout_var,
+            self.post_reboot_poll_var,
+            self.parallel_workers_var,
+        ]
+        for var in config_vars:
+            spin = getattr(var, "_spin", None)
+            if spin:
+                var.set(spin.value())
+
+    def create_config_interface(self, parent):
+        """Tworzy interfejs konfiguracji z edytowalnymi parametrami."""
+        layout = QVBoxLayout(parent)
+
+        self.ssh_timeout_var = IntVar(self.ssh_timeout)
+        self.ssh_keepalive_var = IntVar(self.ssh_keepalive)
+        self.retry_attempts_var = IntVar(self.retry_attempts)
+        self.retry_delay_var = IntVar(self.retry_delay)
+        self.pause_between_var = IntVar(self.pause_between_devices)
+        self.upload_timeout_var = IntVar(self.upload_timeout)
+        self.update_command_timeout_var = IntVar(self.update_command_timeout)
+        self.idle_timeout_var = IntVar(self.idle_timeout)
+        self.post_reboot_wait_var = IntVar(self.post_reboot_wait)
+        self.post_reboot_timeout_var = IntVar(self.post_reboot_timeout)
+        self.post_reboot_poll_var = IntVar(self.post_reboot_poll)
+        self.parallel_workers_var = IntVar(self.parallel_workers)
+
+        sections = [
+            ("SSH Settings", [
+                ("Connection Timeout:", self.ssh_timeout_var, 10, 120, 1, " s"),
+                ("Keepalive Interval:", self.ssh_keepalive_var, 10, 120, 1, " s"),
+            ]),
+            ("Retry Settings", [
+                ("Retry Attempts:", self.retry_attempts_var, 1, 10, 1, ""),
+                ("Retry Delay:", self.retry_delay_var, 5, 60, 1, " s"),
+            ]),
+            ("Transfer Settings", [
+                ("Pause Between Devices:", self.pause_between_var, 0, 30, 1, " s"),
+                ("Upload Timeout (firmware):", self.upload_timeout_var, 300, 3600, 300, " s"),
+                ("Idle Timeout (no progress):", self.idle_timeout_var, 30, 300, 1, " s"),
+                ("Update Command Timeout:", self.update_command_timeout_var, 300, 1800, 60, " s"),
+            ]),
+            ("Reboot Settings", [
+                ("Initial Wait After Reboot:", self.post_reboot_wait_var, 30, 180, 1, " s"),
+                ("Reconnect Global Timeout:", self.post_reboot_timeout_var, 120, 600, 1, " s"),
+                ("Poll Interval:", self.post_reboot_poll_var, 3, 30, 1, " s"),
+            ]),
+            ("Parallel Processing", [
+                ("Parallel PLC workers:", self.parallel_workers_var, 1, 5, 1, ""),
+            ]),
+        ]
+
+        for title, rows in sections:
+            box = QGroupBox(title)
+            grid = QGridLayout(box)
+            for i, (text, var, minimum, maximum, step, suffix) in enumerate(rows):
+                self._create_spin_row(grid, i, text, var, minimum, maximum, step, suffix)
+            layout.addWidget(box)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.create_action_button(parent, "Zastosuj zmiany", self.apply_config, "primary"))
+        buttons.addWidget(self.create_action_button(parent, "Przywroc domyslne", self.reset_config, "neutral"))
+        layout.addLayout(buttons)
+        layout.addStretch()
+
+    def create_manual_interface(self, parent):
+        """Tworzy nowoczesny interfejs do ręcznej obsługi pojedynczego sterownika."""
+        layout = QVBoxLayout(parent)
+
+        connection_box = QGroupBox("Połączenie")
+        connection_layout = QGridLayout(connection_box)
+        connection_layout.addWidget(QLabel("Adres IP:"), 0, 0)
+        self.ip_entry = CompatLineEdit()
+        connection_layout.addWidget(self.ip_entry, 0, 1)
+        connection_layout.addWidget(QLabel("Hasło:"), 1, 0)
+        self.password_entry = CompatLineEdit()
+        self.password_entry.setEchoMode(QLineEdit.Password)
+        connection_layout.addWidget(self.password_entry, 1, 1)
+
+        connection_layout.addWidget(QLabel("Typ sterownika:"), 2, 0)
+        plc_radio_layout = QHBoxLayout()
+        self.manual_plc_type_var = StringVar("2152")
+        radio_2152 = QRadioButton("AXC F 2152")
+        radio_3152 = QRadioButton("AXC F 3152")
+        radio_2152.setChecked(True)
+        radio_2152.toggled.connect(lambda checked: self.manual_plc_type_var.set("2152") if checked else None)
+        radio_3152.toggled.connect(lambda checked: self.manual_plc_type_var.set("3152") if checked else None)
+        group = QButtonGroup(parent)
+        group.addButton(radio_2152)
+        group.addButton(radio_3152)
+        plc_radio_layout.addWidget(radio_2152)
+        plc_radio_layout.addWidget(radio_3152)
+        connection_layout.addLayout(plc_radio_layout, 2, 1)
+        connection_layout.addWidget(self.create_action_button(connection_box, "Odczytaj dane z PLC", self.manual_read_plc, "primary"), 3, 0, 1, 2)
+        layout.addWidget(connection_box)
+
+        self.ip_entry.editingFinished.connect(lambda: self._clean_ip_field(self.ip_entry))
+
+        self.manual_data_label = CompatLabel("Tutaj pojawią się dane z PLC.")
+        self.manual_data_label.setWordWrap(True)
+        self.manual_data_label.setStyleSheet("padding: 12px; border: 1px solid #475569; border-radius: 8px;")
+        layout.addWidget(self.manual_data_label)
+
+        ops_box = QGroupBox("Operacje pojedyncze")
+        ops_layout = QVBoxLayout(ops_box)
+        ops_layout.addWidget(self.create_action_button(ops_box, "Ustaw strefę czasową", self.manual_set_timezone, "warning"))
+        ops_layout.addWidget(self.create_action_button(ops_box, "Wyślij System Services", self.manual_upload_system_services, "info"))
+        layout.addWidget(ops_box)
+
+        fw_box = QGroupBox("Aktualizacja Firmware")
+        fw_layout = QVBoxLayout(fw_box)
+        fw_layout.addWidget(self.create_action_button(fw_box, "Wybierz plik firmware", self.select_manual_firmware, "neutral"))
+        self.manual_firmware_path = StringVar()
+        self.manual_firmware_path_label = QLineEdit()
+        self.manual_firmware_path_label.setReadOnly(True)
+        self.manual_firmware_path.trace_add("write", lambda *_: self.manual_firmware_path_label.setText(self.manual_firmware_path.get()))
+        fw_layout.addWidget(self.manual_firmware_path_label)
+        fw_buttons = QHBoxLayout()
+        fw_buttons.addWidget(self.create_action_button(fw_box, "Wyślij firmware", self.manual_upload_firmware, "success"))
+        fw_buttons.addWidget(self.create_action_button(fw_box, "Wykonaj aktualizację", self.manual_execute_update, "danger"))
+        fw_layout.addLayout(fw_buttons)
+        layout.addWidget(fw_box)
+        layout.addStretch()
 
     def update_action_buttons_state(self):
         """Włącza/wyłącza przyciski zgodnie z aktualnym etapem pracy."""
@@ -1627,196 +1738,10 @@ class BatchProcessorApp(tk.Tk):
             values, tags = self.get_device_row_render_data(device)
             self.device_tree.insert("", "end", text=device.name, values=values, tags=tags)
 
-    def create_config_interface(self, parent):
-        """Tworzy interfejs konfiguracji z edytowalnymi parametrami."""
-        
-        # Kontener główny z scrollem
-        canvas = tk.Canvas(parent, bg="#F8FAFC", highlightthickness=0)
-        scrollbar = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg="#F8FAFC")
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # SSH Settings
-        ssh_frame = tk.LabelFrame(scrollable_frame,
-                                 text="  SSH Settings  ",
-                                 padx=20, pady=15,
-                                 font=('Segoe UI', 11, 'bold'),
-                                 fg="#1E293B",
-                                 bg="#F8FAFC",
-                                 relief="solid",
-                                 borderwidth=1)
-        ssh_frame.pack(fill="x", padx=15, pady=10)
-        
-        # SSH Timeout
-        tk.Label(ssh_frame, text="Connection Timeout:", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=0, column=0, sticky="w", pady=5)
-        self.ssh_timeout_var = tk.IntVar(value=self.ssh_timeout)
-        tk.Spinbox(ssh_frame, from_=10, to=120, textvariable=self.ssh_timeout_var,
-                  width=10, font=('Segoe UI', 10)).grid(row=0, column=1, padx=10, pady=5)
-        tk.Label(ssh_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=0, column=2, sticky="w")
-        
-        # SSH Keepalive
-        tk.Label(ssh_frame, text="Keepalive Interval:", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=1, column=0, sticky="w", pady=5)
-        self.ssh_keepalive_var = tk.IntVar(value=self.ssh_keepalive)
-        tk.Spinbox(ssh_frame, from_=10, to=120, textvariable=self.ssh_keepalive_var,
-                  width=10, font=('Segoe UI', 10)).grid(row=1, column=1, padx=10, pady=5)
-        tk.Label(ssh_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=1, column=2, sticky="w")
-        
-        # Retry Settings
-        retry_frame = tk.LabelFrame(scrollable_frame,
-                                   text="  Retry Settings  ",
-                                   padx=20, pady=15,
-                                   font=('Segoe UI', 11, 'bold'),
-                                   fg="#1E293B",
-                                   bg="#F8FAFC",
-                                   relief="solid",
-                                   borderwidth=1)
-        retry_frame.pack(fill="x", padx=15, pady=10)
-        
-        # Retry Attempts
-        tk.Label(retry_frame, text="Retry Attempts:", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=0, column=0, sticky="w", pady=5)
-        self.retry_attempts_var = tk.IntVar(value=self.retry_attempts)
-        tk.Spinbox(retry_frame, from_=1, to=10, textvariable=self.retry_attempts_var,
-                  width=10, font=('Segoe UI', 10)).grid(row=0, column=1, padx=10, pady=5)
-        tk.Label(retry_frame, text="razy", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=0, column=2, sticky="w")
-        
-        # Retry Delay
-        tk.Label(retry_frame, text="Retry Delay:", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=1, column=0, sticky="w", pady=5)
-        self.retry_delay_var = tk.IntVar(value=self.retry_delay)
-        tk.Spinbox(retry_frame, from_=5, to=60, textvariable=self.retry_delay_var,
-                  width=10, font=('Segoe UI', 10)).grid(row=1, column=1, padx=10, pady=5)
-        tk.Label(retry_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=1, column=2, sticky="w")
-        
-        # Transfer Settings
-        transfer_frame = tk.LabelFrame(scrollable_frame,
-                                      text="  Transfer Settings  ",
-                                      padx=20, pady=15,
-                                      font=('Segoe UI', 11, 'bold'),
-                                      fg="#1E293B",
-                                      bg="#F8FAFC",
-                                      relief="solid",
-                                      borderwidth=1)
-        transfer_frame.pack(fill="x", padx=15, pady=10)
-        
-        # Pause Between Devices
-        tk.Label(transfer_frame, text="Pause Between Devices:", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=0, column=0, sticky="w", pady=5)
-        self.pause_between_var = tk.IntVar(value=self.pause_between_devices)
-        tk.Spinbox(transfer_frame, from_=0, to=30, textvariable=self.pause_between_var,
-                  width=10, font=('Segoe UI', 10)).grid(row=0, column=1, padx=10, pady=5)
-        tk.Label(transfer_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=0, column=2, sticky="w")
-        
-        # Upload Timeout
-        tk.Label(transfer_frame, text="Upload Timeout (firmware):", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=1, column=0, sticky="w", pady=5)
-        self.upload_timeout_var = tk.IntVar(value=self.upload_timeout)
-        tk.Spinbox(transfer_frame, from_=300, to=3600, increment=300, textvariable=self.upload_timeout_var,
-                  width=10, font=('Segoe UI', 10)).grid(row=1, column=1, padx=10, pady=5)
-        tk.Label(transfer_frame, text="s (15min)", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=1, column=2, sticky="w")
-        
-        # Idle Timeout
-        tk.Label(transfer_frame, text="Idle Timeout (no progress):", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=2, column=0, sticky="w", pady=5)
-        self.idle_timeout_var = tk.IntVar(value=self.idle_timeout)
-        tk.Spinbox(transfer_frame, from_=30, to=300, textvariable=self.idle_timeout_var,
-                  width=10, font=('Segoe UI', 10)).grid(row=2, column=1, padx=10, pady=5)
-        tk.Label(transfer_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=2, column=2, sticky="w")
-
-        # Update Command Timeout
-        tk.Label(transfer_frame, text="Update Command Timeout (update-axcf):", 
-            font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=3, column=0, sticky="w", pady=5)
-        self.update_command_timeout_var = tk.IntVar(value=self.update_command_timeout)
-        tk.Spinbox(transfer_frame, from_=300, to=1800, increment=60, textvariable=self.update_command_timeout_var,
-              width=10, font=('Segoe UI', 10)).grid(row=3, column=1, padx=10, pady=5)
-        tk.Label(transfer_frame, text="s (10min)", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=3, column=2, sticky="w")
-        
-        # Reboot Settings
-        reboot_frame = tk.LabelFrame(scrollable_frame,
-                                    text="  Reboot Settings  ",
-                                    padx=20, pady=15,
-                                    font=('Segoe UI', 11, 'bold'),
-                                    fg="#1E293B",
-                                    bg="#F8FAFC",
-                                    relief="solid",
-                                    borderwidth=1)
-        reboot_frame.pack(fill="x", padx=15, pady=10)
-        
-        # Post Reboot Wait
-        tk.Label(reboot_frame, text="Initial Wait After Reboot:", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=0, column=0, sticky="w", pady=5)
-        self.post_reboot_wait_var = tk.IntVar(value=self.post_reboot_wait)
-        tk.Spinbox(reboot_frame, from_=30, to=180, textvariable=self.post_reboot_wait_var,
-                  width=10, font=('Segoe UI', 10)).grid(row=0, column=1, padx=10, pady=5)
-        tk.Label(reboot_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=0, column=2, sticky="w")
-        
-        # Post Reboot Timeout
-        tk.Label(reboot_frame, text="Reconnect Global Timeout:", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=1, column=0, sticky="w", pady=5)
-        self.post_reboot_timeout_var = tk.IntVar(value=self.post_reboot_timeout)
-        tk.Spinbox(reboot_frame, from_=120, to=600, textvariable=self.post_reboot_timeout_var,
-                  width=10, font=('Segoe UI', 10)).grid(row=1, column=1, padx=10, pady=5)
-        tk.Label(reboot_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=1, column=2, sticky="w")
-        
-        # Post Reboot Poll
-        tk.Label(reboot_frame, text="Poll Interval:", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=2, column=0, sticky="w", pady=5)
-        self.post_reboot_poll_var = tk.IntVar(value=self.post_reboot_poll)
-        tk.Spinbox(reboot_frame, from_=3, to=30, textvariable=self.post_reboot_poll_var,
-                  width=10, font=('Segoe UI', 10)).grid(row=2, column=1, padx=10, pady=5)
-        tk.Label(reboot_frame, text="s", font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=2, column=2, sticky="w")
-        
-        # Parallel Processing
-        parallel_frame = tk.LabelFrame(scrollable_frame,
-                          text="  Parallel Processing  ",
-                                      padx=20, pady=15,
-                                      font=('Segoe UI', 11, 'bold'),
-                                      fg="#1E293B",
-                                      bg="#F8FAFC",
-                                      relief="solid",
-                                      borderwidth=1)
-        parallel_frame.pack(fill="x", padx=15, pady=10)
-        
-        tk.Label(parallel_frame, text="Parallel PLC workers:", 
-                font=('Segoe UI', 10), bg="#F8FAFC", fg="#475569").grid(row=0, column=0, sticky="w", pady=5)
-        self.parallel_workers_var = tk.IntVar(value=self.parallel_workers)
-        tk.Spinbox(parallel_frame, from_=1, to=5, textvariable=self.parallel_workers_var,
-              width=10, font=('Segoe UI', 10)).grid(row=0, column=1, padx=10, pady=5, sticky="w")
-        tk.Label(parallel_frame, text="(1-5)", 
-            font=('Segoe UI', 10), bg="#F8FAFC", fg="#64748B").grid(row=0, column=2, sticky="w")
-        
-        # Przyciski
-        button_frame = tk.Frame(scrollable_frame, bg="#F8FAFC")
-        button_frame.pack(fill="x", padx=15, pady=20)
-        
-        self.create_action_button(
-            button_frame,
-            text="Zastosuj zmiany",
-            command=self.apply_config,
-            variant="primary"
-        ).pack(side="left", padx=5, fill="x", expand=True)
-        
-        self.create_action_button(
-            button_frame,
-            text="Przywroc domyslne",
-            command=self.reset_config,
-            variant="neutral"
-        ).pack(side="left", padx=5, fill="x", expand=True)
-        
-        canvas.pack(side="left", fill="both", expand=True, padx=10, pady=10)
-        scrollbar.pack(side="right", fill="y")
 
     def apply_config(self):
         """Zastosuj zmiany z zakładki konfiguracji."""
+        self._sync_config_vars_from_controls()
         self.ssh_timeout = self.ssh_timeout_var.get()
         self.ssh_keepalive = self.ssh_keepalive_var.get()
         self.retry_attempts = self.retry_attempts_var.get()
@@ -1835,18 +1760,18 @@ class BatchProcessorApp(tk.Tk):
 
     def reset_config(self):
         """Przywróć domyślne wartości konfiguracji."""
-        self.ssh_timeout_var.set(DEFAULT_SSH_TIMEOUT)
-        self.ssh_keepalive_var.set(DEFAULT_SSH_KEEPALIVE)
-        self.retry_attempts_var.set(DEFAULT_RETRY_ATTEMPTS)
-        self.retry_delay_var.set(DEFAULT_RETRY_DELAY)
-        self.pause_between_var.set(DEFAULT_PAUSE_BETWEEN)
-        self.upload_timeout_var.set(DEFAULT_UPLOAD_TIMEOUT)
-        self.update_command_timeout_var.set(DEFAULT_UPDATE_COMMAND_TIMEOUT)
-        self.idle_timeout_var.set(DEFAULT_IDLE_TIMEOUT)
-        self.post_reboot_wait_var.set(DEFAULT_POST_REBOOT_WAIT)
-        self.post_reboot_timeout_var.set(DEFAULT_POST_REBOOT_TIMEOUT)
-        self.post_reboot_poll_var.set(DEFAULT_POST_REBOOT_POLL)
-        self.parallel_workers_var.set(DEFAULT_PARALLEL_WORKERS)
+        self._set_config_var(self.ssh_timeout_var, DEFAULT_SSH_TIMEOUT)
+        self._set_config_var(self.ssh_keepalive_var, DEFAULT_SSH_KEEPALIVE)
+        self._set_config_var(self.retry_attempts_var, DEFAULT_RETRY_ATTEMPTS)
+        self._set_config_var(self.retry_delay_var, DEFAULT_RETRY_DELAY)
+        self._set_config_var(self.pause_between_var, DEFAULT_PAUSE_BETWEEN)
+        self._set_config_var(self.upload_timeout_var, DEFAULT_UPLOAD_TIMEOUT)
+        self._set_config_var(self.update_command_timeout_var, DEFAULT_UPDATE_COMMAND_TIMEOUT)
+        self._set_config_var(self.idle_timeout_var, DEFAULT_IDLE_TIMEOUT)
+        self._set_config_var(self.post_reboot_wait_var, DEFAULT_POST_REBOOT_WAIT)
+        self._set_config_var(self.post_reboot_timeout_var, DEFAULT_POST_REBOOT_TIMEOUT)
+        self._set_config_var(self.post_reboot_poll_var, DEFAULT_POST_REBOOT_POLL)
+        self._set_config_var(self.parallel_workers_var, DEFAULT_PARALLEL_WORKERS)
         
         self.apply_config()
         self.log("Przywrocono domyslne ustawienia")
@@ -1859,172 +1784,6 @@ class BatchProcessorApp(tk.Tk):
             entry_widget.delete(0, tk.END)
             entry_widget.insert(0, cleaned)
             self.log(f"Oczyszczono IP: '{current_value}' -> '{cleaned}'")
-
-    def create_manual_interface(self, parent):
-        """Tworzy nowoczesny interfejs do ręcznej obsługi pojedynczego sterownika."""
-        
-        connection_frame = tk.LabelFrame(parent, 
-                                        text="  Połączenie  ", 
-                                        padx=15, pady=15,
-                                        font=('Segoe UI', 11, 'bold'),
-                                        fg="#1E293B",
-                                        bg="#F8FAFC",
-                                        relief="solid",
-                                        borderwidth=1)
-        connection_frame.pack(fill="x", padx=12, pady=8)
-        
-        tk.Label(connection_frame, 
-                text="Adres IP:", 
-                font=('Segoe UI', 10, 'bold'),
-                bg="#F8FAFC",
-                fg="#1E293B").pack(pady=(0,5))
-        self.ip_entry = tk.Entry(connection_frame, 
-                                width=25,
-                                font=('Segoe UI', 11),
-                                relief="solid",
-                                borderwidth=1)
-        self.ip_entry.pack(pady=(0,10))
-        
-        # Auto-czyszczenie IP przy wklejaniu (Ctrl+V lub paste)
-        def on_ip_paste(event):
-            # Dodaj opóźnienie aby pozwolić na wklejenie
-            self.after(50, lambda: self._clean_ip_field(self.ip_entry))
-        
-        self.ip_entry.bind('<Control-v>', on_ip_paste)
-        self.ip_entry.bind('<Button-3>', on_ip_paste)  # prawy klik -> paste
-        self.ip_entry.bind('<FocusOut>', lambda e: self._clean_ip_field(self.ip_entry))
-        
-        tk.Label(connection_frame, 
-                text="Hasło:", 
-                font=('Segoe UI', 10, 'bold'),
-                bg="#F8FAFC",
-                fg="#1E293B").pack(pady=(0,5))
-        self.password_entry = tk.Entry(connection_frame, 
-                                      show="*", 
-                                      width=25,
-                                      font=('Segoe UI', 11),
-                                      relief="solid",
-                                      borderwidth=1)
-        self.password_entry.pack(pady=(0,10))
-        
-        # DODANE: Typ sterownika dla ręcznej obsługi
-        tk.Label(connection_frame, 
-                text="Typ sterownika:", 
-                font=('Segoe UI', 10, 'bold'),
-                bg="#F8FAFC",
-                fg="#1E293B").pack(pady=(10, 5))
-        self.manual_plc_type_var = tk.StringVar(value="2152")
-        plc_manual_frame = tk.Frame(connection_frame, bg="#F8FAFC")
-        plc_manual_frame.pack(pady=(0,10))
-        tk.Radiobutton(plc_manual_frame, 
-                      text="AXC F 2152", 
-                      variable=self.manual_plc_type_var, 
-                      value="2152",
-                      font=('Segoe UI', 10),
-                      bg="#F8FAFC",
-                      fg="#1E293B",
-                      selectcolor="#FFFFFF",
-                      activebackground="#F8FAFC").pack(side="left", padx=10)
-        tk.Radiobutton(plc_manual_frame, 
-                      text="AXC F 3152", 
-                      variable=self.manual_plc_type_var, 
-                      value="3152",
-                      font=('Segoe UI', 10),
-                      bg="#F8FAFC",
-                      fg="#1E293B",
-                      selectcolor="#FFFFFF",
-                      activebackground="#F8FAFC").pack(side="left", padx=10)
-        
-        self.create_action_button(
-            connection_frame,
-            text="Odczytaj dane z PLC",
-            command=self.manual_read_plc,
-            variant="primary"
-        ).pack(pady=10)
-        
-        self.manual_data_label = tk.Label(parent, 
-                                         text="Tutaj pojawią się dane z PLC.",
-                                         bg="#FFFFFF",
-                                         fg="#475569",
-                                         relief="solid",
-                                         borderwidth=1,
-                                         justify="left",
-                                         font=("Segoe UI", 10), 
-                                         wraplength=500, 
-                                         padx=15, pady=15,
-                                         anchor="nw")
-        self.manual_data_label.pack(fill="x", padx=12, pady=8)
-        
-        # Sekcja operacji ręcznych
-        operations_frame = tk.LabelFrame(parent, 
-                                        text="  Operacje pojedyncze  ", 
-                                        padx=15, pady=12,
-                                        font=('Segoe UI', 11, 'bold'),
-                                        fg="#1E293B",
-                                        bg="#F8FAFC",
-                                        relief="solid",
-                                        borderwidth=1)
-        operations_frame.pack(fill="x", padx=12, pady=8)
-        
-        # Strefa czasowa
-        self.create_action_button(
-            operations_frame,
-            text="Ustaw strefę czasową",
-            command=self.manual_set_timezone,
-            variant="warning"
-        ).pack(fill="x", padx=5, pady=3)
-        
-        # System Services
-        self.create_action_button(
-            operations_frame,
-            text="Wyślij System Services",
-            command=self.manual_upload_system_services,
-            variant="info"
-        ).pack(fill="x", padx=5, pady=3)
-        
-        # Firmware
-        firmware_manual_frame = tk.LabelFrame(parent, 
-                                             text="  Aktualizacja Firmware  ", 
-                                             padx=15, pady=12,
-                                             font=('Segoe UI', 11, 'bold'),
-                                             fg="#1E293B",
-                                             bg="#F8FAFC",
-                                             relief="solid",
-                                             borderwidth=1)
-        firmware_manual_frame.pack(fill="x", padx=12, pady=8)
-        
-        self.create_action_button(
-            firmware_manual_frame,
-            text="Wybierz plik firmware",
-            command=self.select_manual_firmware,
-            variant="neutral"
-        ).pack(pady=8)
-        self.manual_firmware_path = tk.StringVar()
-        tk.Label(firmware_manual_frame, 
-                textvariable=self.manual_firmware_path, 
-                bg="#FFFFFF",
-                fg="#475569",
-                relief="solid",
-                borderwidth=1,
-                font=('Segoe UI', 10),
-                wraplength=500,
-                padx=10, pady=8,
-                anchor="w").pack(pady=8, fill="x", padx=5)
-        
-        manual_fw_buttons = tk.Frame(firmware_manual_frame)
-        manual_fw_buttons.pack(pady=5)
-        self.create_action_button(
-            manual_fw_buttons,
-            text="Wyślij firmware",
-            command=self.manual_upload_firmware,
-            variant="success"
-        ).pack(side="left", padx=5)
-        self.create_action_button(
-            manual_fw_buttons,
-            text="Wykonaj aktualizację",
-            command=self.manual_execute_update,
-            variant="danger"
-        ).pack(side="left", padx=5)
 
     def select_excel(self):
         """Wybór pliku Excel."""
