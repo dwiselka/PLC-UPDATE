@@ -82,9 +82,14 @@ class BatchProcessorApp(tk.Tk):
         self.processing = False
         self.log_queue = queue.Queue()
         self.upload_log_progress = {}
+        self.show_errors_only = tk.BooleanVar(value=False)
         
         # Tworzenie GUI
         self.create_widgets()
+
+        self.firmware_path.trace_add("write", lambda *_: self.update_action_buttons_state())
+        self.excel_path.trace_add("write", lambda *_: self.update_action_buttons_state())
+        self.update_action_buttons_state()
         
         # Timer do aktualizacji logów
         self.update_logs()
@@ -416,21 +421,35 @@ class BatchProcessorApp(tk.Tk):
         operation: "read", "system_services", "timezone", "firmware", "all"
         """
         self.processing = True
-        self.stop_btn.config(state="normal")
+        self.after(0, self.update_action_buttons_state)
         
         total = len(self.devices)
         success_count = 0
         failed_count = 0
+        failed_devices = []
         
         self.log(f"{'='*60}")
         self.log(f"🚀 START OPERACJI WSADOWEJ: {operation.upper()}")
         self.log(f"📊 Liczba sterowników: {total}")
         self.log(f"{'='*60}")
+
+        self.after(0, lambda: self.batch_progress.config(value=0))
+        self.after(0, lambda: self.batch_progress_label.config(
+            text=f"Start operacji {operation.upper()} (0/{total})",
+            fg="blue"
+        ))
         
         for idx, device in enumerate(self.devices, 1):
             if not self.processing:
                 self.log("⏹️  Operacja zatrzymana przez użytkownika")
                 break
+
+            progress_before = ((idx - 1) / total) * 100 if total else 0
+            self.after(0, lambda p=progress_before: self.batch_progress.config(value=p))
+            self.after(0, lambda i=idx, t=total, d=device: self.batch_progress_label.config(
+                text=f"Sterownik {i}/{t}: {d.name} ({d.ip})",
+                fg="blue"
+            ))
             
             # OPÓŹNIENIE MIĘDZY STEROWNIKAMI (oprócz pierwszego)
             if idx > 1:
@@ -491,6 +510,7 @@ class BatchProcessorApp(tk.Tk):
                     if self.is_fatal_error(e):
                         device.status = "✗ Błąd"
                         failed_count += 1
+                        failed_devices.append((device.name, error_msg))
                         self.log(f"✗ [{device.name}] Błąd krytyczny (bez retry): {error_msg}")
                         break
 
@@ -505,6 +525,7 @@ class BatchProcessorApp(tk.Tk):
                     else:
                         device.status = "✗ Błąd"
                         failed_count += 1
+                        failed_devices.append((device.name, error_msg))
                         if self.is_transient_error(e):
                             self.log(f"✗ [{device.name}] Operacja nieudana po {RETRY_ATTEMPTS} próbach: {error_msg}")
                         else:
@@ -513,6 +534,26 @@ class BatchProcessorApp(tk.Tk):
                 
                 finally:
                     self.after(0, lambda d=device: self.update_device_row(d))
+
+            progress_after = (idx / total) * 100 if total else 0
+            self.after(0, lambda p=progress_after: self.batch_progress.config(value=p))
+            self.after(0, lambda i=idx, t=total: self.batch_progress_label.config(
+                text=f"Postęp: {i}/{t} sterowników",
+                fg="blue"
+            ))
+
+        processed_count = success_count + failed_count
+        not_processed_count = max(0, total - processed_count)
+
+        recommendations = []
+        if failed_devices:
+            failed_text = "\n".join(msg for _, msg in failed_devices).lower()
+            if "niezgodność" in failed_text or "kompatybil" in failed_text:
+                recommendations.append("- Sprawdź zgodność modelu firmware (axcf2152/axcf3152).")
+            if any(word in failed_text for word in ["timeout", "timed out", "connection", "socket", "eof"]):
+                recommendations.append("- Sprawdź łączność sieciową i dostęp SSH do sterowników.")
+            if "nie istnieje" in failed_text:
+                recommendations.append("- Zweryfikuj obecność wymaganych plików lokalnych (firmware/System Services).")
         
         # Podsumowanie
         self.log(f"\n{'='*60}")
@@ -520,19 +561,36 @@ class BatchProcessorApp(tk.Tk):
         self.log(f"{'='*60}")
         self.log(f"✓ Sukces: {success_count}/{total}")
         self.log(f"✗ Błędy: {failed_count}/{total}")
+        self.log(f"⏭️ Nieprzetworzone: {not_processed_count}/{total}")
+        if failed_devices:
+            self.log("⚠️ Lista nieudanych sterowników:")
+            for name, err in failed_devices[:10]:
+                self.log(f"   - {name}: {err[:120]}")
+            if len(failed_devices) > 10:
+                self.log(f"   ... i {len(failed_devices) - 10} więcej")
+
+        if recommendations:
+            self.log("💡 Rekomendacje:")
+            for recommendation in recommendations:
+                self.log(f"   {recommendation}")
         self.log(f"{'='*60}\n")
         
         self.processing = False
-        self.stop_btn.config(state="disabled")
-        self.status_bar.config(text="Gotowy")
+        self.after(0, self.update_action_buttons_state)
+        self.after(0, lambda: self.status_bar.config(text="Gotowy"))
+        self.after(0, lambda: self.batch_progress_label.config(
+            text=f"Zakończono: sukces {success_count}, błędy {failed_count}, nieprzetworzone {not_processed_count}",
+            fg="green" if failed_count == 0 else "red"
+        ))
         
         # Pokaż podsumowanie
         self.after(0, lambda: messagebox.showinfo(
             "Operacja zakończona",
             f"Operacja: {operation.upper()}\n\n"
             f"✓ Sukces: {success_count}/{total}\n"
-            f"✗ Błędy: {failed_count}/{total}\n\n"
-            f"Sprawdź logi, aby uzyskać szczegóły."
+            f"✗ Błędy: {failed_count}/{total}\n"
+            f"⏭️ Nieprzetworzone: {not_processed_count}/{total}\n\n"
+            f"Sprawdź logi i zakładkę tabeli, aby uzyskać szczegóły."
         ))
 
 
@@ -796,10 +854,11 @@ class BatchProcessorApp(tk.Tk):
 
         tk.Label(excel_frame, textvariable=self.excel_path, bg="lightgray", relief="sunken", width=60).pack(side="left", padx=5)
 
-        tk.Button(excel_frame,
-                  text="Wczytaj listę",
-                  command=self.load_excel,
-                  font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        self.load_excel_btn = tk.Button(excel_frame,
+                        text="Wczytaj listę",
+                        command=self.load_excel,
+                        font=("Arial", 10, "bold"))
+        self.load_excel_btn.pack(side="left", padx=5)
         
         # Sekcja firmware
         firmware_frame = tk.LabelFrame(batch_frame, text="Plik Firmware (opcjonalnie dla aktualizacji)", padx=10, pady=10)
@@ -821,8 +880,9 @@ class BatchProcessorApp(tk.Tk):
         # Przyciski akcji - ODCZYT
         read_frame = tk.LabelFrame(batch_frame, text="Odczyt danych", padx=10, pady=5)
         read_frame.pack(fill="x", padx=10, pady=5)
-        tk.Button(read_frame, text="Odczytaj wszystkie sterowniki", command=self.batch_read_all, 
-        bg="#05DF72", fg="black", font=("Arial", 10, "bold")).pack(fill="x", padx=5, pady=4)
+        self.batch_read_btn = tk.Button(read_frame, text="Odczytaj wszystkie sterowniki", command=self.batch_read_all, 
+                        bg="#05DF72", fg="black", font=("Arial", 10, "bold"))
+        self.batch_read_btn.pack(fill="x", padx=5, pady=4)
 
         # Przyciski akcji - AKTUALIZACJE (osobne)
         update_frame = tk.LabelFrame(batch_frame, text="Aktualizacje (wykonywane osobno)", padx=10, pady=5)
@@ -831,21 +891,25 @@ class BatchProcessorApp(tk.Tk):
         btn_grid = tk.Frame(update_frame)
         btn_grid.pack(fill="x", padx=5, pady=5)
         
-        tk.Button(btn_grid, text="Wyślij System Services (wszystkie)", 
-        command=self.batch_system_services, 
-        bg="#A2F4FD", fg="black", font=("Arial", 10, "bold")).grid(row=0, column=0, padx=3, pady=2, sticky="ew")
+        self.batch_sys_btn = tk.Button(btn_grid, text="Wyślij System Services (wszystkie)", 
+                           command=self.batch_system_services, 
+                           bg="#A2F4FD", fg="black", font=("Arial", 10, "bold"))
+        self.batch_sys_btn.grid(row=0, column=0, padx=3, pady=2, sticky="ew")
 
-        tk.Button(btn_grid, text="Ustaw strefę czasową (wszystkie)", 
-            command=self.batch_timezone, 
-            bg="#FFF085", fg="black", font=("Arial", 10, "bold")).grid(row=0, column=1, padx=3, pady=2, sticky="ew")
+        self.batch_tz_btn = tk.Button(btn_grid, text="Ustaw strefę czasową (wszystkie)", 
+                                      command=self.batch_timezone, 
+                                      bg="#FFF085", fg="black", font=("Arial", 10, "bold"))
+        self.batch_tz_btn.grid(row=0, column=1, padx=3, pady=2, sticky="ew")
 
-        tk.Button(btn_grid, text="Aktualizuj Firmware (wszystkie)", 
-            command=self.batch_firmware_only, 
-            bg="#BEDBFF", fg="black", font=("Arial", 10, "bold")).grid(row=1, column=0, padx=3, pady=2, sticky="ew")
+        self.batch_fw_btn = tk.Button(btn_grid, text="Aktualizuj Firmware (wszystkie)", 
+                                      command=self.batch_firmware_only, 
+                                      bg="#BEDBFF", fg="black", font=("Arial", 10, "bold"))
+        self.batch_fw_btn.grid(row=1, column=0, padx=3, pady=2, sticky="ew")
 
-        tk.Button(btn_grid, text="WYKONAJ WSZYSTKO NARAZ", 
-            command=self.batch_update_all, 
-            bg="#FFCCD3", fg="black", font=("Arial", 10, "bold")).grid(row=1, column=1, padx=3, pady=2, sticky="ew")
+        self.batch_all_btn = tk.Button(btn_grid, text="WYKONAJ WSZYSTKO NARAZ", 
+                                       command=self.batch_update_all, 
+                                       bg="#FFCCD3", fg="black", font=("Arial", 10, "bold"))
+        self.batch_all_btn.grid(row=1, column=1, padx=3, pady=2, sticky="ew")
         
         btn_grid.columnconfigure(0, weight=1)
         btn_grid.columnconfigure(1, weight=1)
@@ -870,17 +934,46 @@ class BatchProcessorApp(tk.Tk):
             fg="gray"
         )
         self.upload_status_label.pack(padx=5, pady=2)
+
+        batch_progress_frame = tk.LabelFrame(batch_frame, text="Postęp operacji wsadowej", padx=10, pady=5)
+        batch_progress_frame.pack(fill="x", padx=10, pady=5)
+
+        self.batch_progress = ttk.Progressbar(
+            batch_progress_frame,
+            orient="horizontal",
+            length=100,
+            mode="determinate"
+        )
+        self.batch_progress.pack(fill="x", padx=5, pady=5)
+
+        self.batch_progress_label = tk.Label(
+            batch_progress_frame,
+            text="Oczekiwanie na start...",
+            font=("Arial", 9),
+            fg="gray"
+        )
+        self.batch_progress_label.pack(padx=5, pady=2)
     
 
         control_frame = tk.Frame(batch_frame)
         control_frame.pack(fill="x", padx=10, pady=5)
 
-        tk.Button(control_frame, text="Zapisz raport Excel", command=self.save_excel, 
-            bg="#2196F3", fg="black", font=("Arial", 10, "bold")).pack(side="left", padx=5, fill="x", expand=True)
+        self.save_excel_btn = tk.Button(control_frame, text="Zapisz raport Excel", command=self.save_excel, 
+            bg="#2196F3", fg="black", font=("Arial", 10, "bold"))
+        self.save_excel_btn.pack(side="left", padx=5, fill="x", expand=True)
 
         self.stop_btn = tk.Button(control_frame, text="STOP", command=self.stop_processing, 
             bg="#F44336", fg="black", font=("Arial", 10, "bold"), state="disabled")
         self.stop_btn.pack(side="left", padx=5, fill="x", expand=True)
+
+        filter_frame = tk.Frame(batch_frame)
+        filter_frame.pack(fill="x", padx=10, pady=(0, 2))
+        tk.Checkbutton(
+            filter_frame,
+            text="Pokaż tylko sterowniki z problemami",
+            variable=self.show_errors_only,
+            command=self.refresh_device_tree
+        ).pack(side="left")
         
         # Tabela ze sterownikami
         table_frame = tk.LabelFrame(batch_frame, text="Lista sterowników", padx=5, pady=5)
@@ -923,7 +1016,7 @@ class BatchProcessorApp(tk.Tk):
 
         # Konfiguracja tagów dla kolorowania
         #self.device_tree.tag_configure('time_error', foreground='red')
-        #self.device_tree.tag_configure('success', foreground='#3D9140')
+        self.device_tree.tag_configure('success', background='#D7FFD9')
         self.device_tree.tag_configure('error', background='#FFA500') #sienna1
         self.device_tree.tag_configure('has_issues', background='#FF4500')
 
@@ -949,6 +1042,109 @@ class BatchProcessorApp(tk.Tk):
         # Status bar
         self.status_bar = tk.Label(self, text="Gotowy", relief="sunken", anchor="w", bg="lightgray")
         self.status_bar.pack(side="bottom", fill="x")
+
+    def update_action_buttons_state(self):
+        """Włącza/wyłącza przyciski zgodnie z aktualnym etapem pracy."""
+        has_devices = len(self.devices) > 0
+        has_firmware = bool(self.firmware_path.get() and os.path.exists(self.firmware_path.get()))
+        is_busy = self.processing
+
+        normal = "normal"
+        disabled = "disabled"
+
+        if hasattr(self, 'load_excel_btn'):
+            self.load_excel_btn.config(state=disabled if is_busy else normal)
+        if hasattr(self, 'batch_read_btn'):
+            self.batch_read_btn.config(state=normal if (has_devices and not is_busy) else disabled)
+        if hasattr(self, 'batch_sys_btn'):
+            self.batch_sys_btn.config(state=normal if (has_devices and not is_busy) else disabled)
+        if hasattr(self, 'batch_tz_btn'):
+            self.batch_tz_btn.config(state=normal if (has_devices and not is_busy) else disabled)
+        if hasattr(self, 'batch_fw_btn'):
+            self.batch_fw_btn.config(state=normal if (has_devices and has_firmware and not is_busy) else disabled)
+        if hasattr(self, 'batch_all_btn'):
+            self.batch_all_btn.config(state=normal if (has_devices and has_firmware and not is_busy) else disabled)
+        if hasattr(self, 'save_excel_btn'):
+            self.save_excel_btn.config(state=normal if (has_devices and not is_busy) else disabled)
+        if hasattr(self, 'stop_btn'):
+            self.stop_btn.config(state=normal if is_busy else disabled)
+
+    def device_has_issues(self, device):
+        """Czy urządzenie ma problemy prezentowane w kolumnie Issues."""
+        if device.time_sync_error:
+            return True
+        if device.system_services_ok not in ["OK", ""]:
+            return True
+        if device.timezone and device.timezone.strip() != TIMEZONE.strip():
+            return True
+        if device.status == "✗ Błąd":
+            return True
+        return False
+
+    def get_device_row_render_data(self, device):
+        """Przygotowuje wartości i tagi dla jednego wiersza tabeli."""
+        issues = []
+        has_issues = False
+
+        plc_time_display = device.plc_time
+        if device.time_sync_error:
+            plc_time_display = f"❌ {device.plc_time}"
+            issues.append("Desynchronizacja czasu")
+            has_issues = True
+
+        sys_services_display = device.system_services_ok
+        if device.system_services_ok not in ["OK", ""]:
+            sys_services_display = f"❌ {device.system_services_ok}"
+            issues.append("System Services")
+            has_issues = True
+
+        timezone_display = device.timezone
+        if device.timezone and device.timezone.strip() != TIMEZONE.strip():
+            timezone_display = f"❌ {device.timezone}"
+            issues.append(f"Strefa czasowa ({device.timezone} ≠ {TIMEZONE})")
+            has_issues = True
+
+        if device.status == "W trakcie...":
+            issues_text = "Sprawdzanie..."
+        elif issues:
+            issues_text = "\n".join(issues)
+        else:
+            issues_text = "✅ Brak"
+
+        values = (
+            device.ip,
+            f"AXC F {device.plc_model}" if device.plc_model else "",
+            device.firmware_version,
+            plc_time_display,
+            timezone_display,
+            sys_services_display,
+            device.last_check,
+            device.status,
+            issues_text
+        )
+
+        if has_issues:
+            tags = ('has_issues',)
+        elif device.status == "✓ OK":
+            tags = ('success',)
+        elif device.status == "✗ Błąd":
+            tags = ('error',)
+        else:
+            tags = ()
+
+        return values, tags
+
+    def refresh_device_tree(self):
+        """Odświeża tabelę urządzeń z uwzględnieniem filtra."""
+        self.device_tree.delete(*self.device_tree.get_children())
+
+        show_only_errors = self.show_errors_only.get()
+        for device in self.devices:
+            if show_only_errors and not self.device_has_issues(device):
+                continue
+
+            values, tags = self.get_device_row_render_data(device)
+            self.device_tree.insert("", "end", text=device.name, values=values, tags=tags)
 
     def create_manual_interface(self, parent):
         """Tworzy interfejs do ręcznej obsługi pojedynczego sterownika."""
@@ -1037,7 +1233,6 @@ class BatchProcessorApp(tk.Tk):
             ws = wb.active
             
             self.devices = []
-            self.device_tree.delete(*self.device_tree.get_children())
             
             # Pomijamy nagłówek (wiersz 1)
             for row in ws.iter_rows(min_row=2, values_only=True):
@@ -1059,19 +1254,10 @@ class BatchProcessorApp(tk.Tk):
                         device.last_check = str(row[6])
                     
                     self.devices.append(device)
-                    self.device_tree.insert("", "end", text=name, values=(
-                        ip,                          # IP (kolumna 0)
-                        "",                          # Model (kolumna 1) - puste, bo nie odczytano jeszcze
-                        device.firmware_version,     # Firmware (kolumna 2)
-                        "",                          # PLCTime (kolumna 3) - puste
-                        device.timezone,             # Timezone (kolumna 4)
-                        device.system_services_ok,   # SysServices (kolumna 5)
-                        device.last_check,           # LastCheck (kolumna 6)
-                        device.status,               # Status (kolumna 7)
-                        ""                           # Issues (kolumna 8) - puste
-                    ))
             
             wb.close()
+            self.refresh_device_tree()
+            self.update_action_buttons_state()
             self.log(f"✓ Wczytano {len(self.devices)} sterowników z pliku Excel")
             messagebox.showinfo("Sukces", f"Wczytano {len(self.devices)} sterowników")
             
@@ -1691,72 +1877,9 @@ class BatchProcessorApp(tk.Tk):
         time.sleep(2)
 
     def update_device_row(self, device):
-        """Aktualizuje pojedynczy wiersz w Treeview z oznaczeniem problemów."""
-        
-        item_id = None
-        for item in self.device_tree.get_children():
-            if self.device_tree.item(item, 'text') == device.name:
-                item_id = item
-                break
-        
-        if item_id:
-            # ZBIERZ PROBLEMY i dodaj ❌ do wartości
-            issues = []
-            has_issues = False
-            
-            # 1. Problem z czasem PLC
-            plc_time_display = device.plc_time
-            if device.time_sync_error:
-                plc_time_display = f"❌ {device.plc_time}"
-                issues.append("Desynchronizacja czasu")
-                has_issues = True
-            
-            # 2. Problem z System Services
-            sys_services_display = device.system_services_ok
-            if device.system_services_ok not in ["OK", ""]:
-                sys_services_display = f"❌ {device.system_services_ok}"
-                issues.append("System Services")
-                has_issues = True
-            
-            # 3. Problem ze strefą czasową
-            timezone_display = device.timezone
-            if device.timezone and device.timezone.strip() != TIMEZONE.strip():
-                timezone_display = f"❌ {device.timezone}"
-                issues.append(f"Strefa czasowa ({device.timezone} ≠ {TIMEZONE})")
-                has_issues = True
-            
-            # ✅ 4. Tekst w kolumnie "Issues" - DODAJ LOGIKĘ DLA "W trakcie..."
-            if device.status == "W trakcie...":
-                issues_text = "Sprawdzanie..."  # ⬅️ NOWE: Podczas odczytu
-            elif issues:
-                issues_text = "\n".join(issues)
-            else:
-                issues_text = "✅ Brak"
-            
-            # AKTUALIZUJ WARTOŚCI z ❌ w problemowych komórkach
-            self.device_tree.item(item_id, values=(
-                device.ip,
-                f"AXC F {device.plc_model}" if device.plc_model else "",
-                device.firmware_version,
-                plc_time_display,
-                timezone_display,
-                sys_services_display,
-                device.last_check, 
-                device.status,
-                issues_text  # ⬅️ Teraz pokazuje " Sprawdzanie..." podczas odczytu
-            ))
-            
-            # KOLORUJ CAŁY WIERSZ jeśli są problemy
-            if has_issues:
-                self.device_tree.item(item_id, tags=('has_issues',))
-            elif device.status == "✓ OK":
-                self.device_tree.item(item_id, tags=('success',))
-            elif device.status == "✗ Błąd":
-                self.device_tree.item(item_id, tags=('error',))
-            else:
-                self.device_tree.item(item_id, tags=())
-            
-            self.device_tree.update_idletasks()
+        """Aktualizuje widok tabeli po zmianie statusu urządzenia."""
+        self.refresh_device_tree()
+        self.device_tree.update_idletasks()
 
     def stop_processing(self):
         """Zatrzymuje przetwarzanie."""
